@@ -1,31 +1,31 @@
 //! Apply socket-level liveness options to TCP streams.
 //!
-//! Layers applied:
-//!  L1 – SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
-//!  L2 – TCP_USER_TIMEOUT  (Linux/Android only)
+//! L1 – SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+//! L2 – TCP_USER_TIMEOUT  (Linux/Android only)
+//!
+//! Failures are logged and swallowed: a socket that won't take an option is
+//! still usable, just less protected, and that shouldn't drop the connection.
 
-use anyhow::Result;
-use socket2::{SockRef, TcpKeepalive};
 use std::time::Duration;
+
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::config::ProxyConfig;
 
-pub fn apply_tcp(stream: &TcpStream, cfg: &ProxyConfig) -> Result<()> {
+pub fn apply_tcp(stream: &TcpStream, cfg: &ProxyConfig) {
     let sr = SockRef::from(stream);
 
     // L1: keepalive
     if cfg.keepalive_idle_secs > 0 {
         let mut ka = TcpKeepalive::new().with_time(Duration::from_secs(cfg.keepalive_idle_secs));
-
         if cfg.keepalive_interval_secs > 0 {
             ka = ka.with_interval(Duration::from_secs(cfg.keepalive_interval_secs));
         }
         if cfg.keepalive_retries > 0 {
             ka = ka.with_retries(cfg.keepalive_retries);
         }
-
         if let Err(e) = sr.set_tcp_keepalive(&ka) {
             warn!("set_tcp_keepalive: {e}");
         }
@@ -40,8 +40,6 @@ pub fn apply_tcp(stream: &TcpStream, cfg: &ProxyConfig) -> Result<()> {
             warn!("set_tcp_user_timeout: {e}");
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -66,46 +64,44 @@ mod tests {
         }
     }
 
-    async fn pair() -> TcpStream {
+    async fn client_stream() -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (client, _server) =
-            tokio::join!(TcpStream::connect(addr), async { listener.accept().await });
+        let (client, _server) = tokio::join!(TcpStream::connect(addr), listener.accept());
         client.unwrap()
     }
 
     #[tokio::test]
-    async fn apply_all_disabled_succeeds() {
-        let stream = pair().await;
-        apply_tcp(&stream, &base_cfg()).unwrap();
+    async fn apply_all_disabled() {
+        let stream = client_stream().await;
+        apply_tcp(&stream, &base_cfg());
     }
 
     #[tokio::test]
     async fn apply_with_keepalive() {
-        let stream = pair().await;
+        let stream = client_stream().await;
         let cfg = ProxyConfig {
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 10,
             keepalive_retries: 6,
             ..base_cfg()
         };
-        apply_tcp(&stream, &cfg).unwrap();
+        apply_tcp(&stream, &cfg);
     }
 
     #[tokio::test]
     async fn apply_with_user_timeout() {
-        let stream = pair().await;
+        let stream = client_stream().await;
         let cfg = ProxyConfig {
             user_timeout_ms: 30_000,
             ..base_cfg()
         };
-        // On Linux this sets TCP_USER_TIMEOUT; on other OSes it's a no-op.
-        apply_tcp(&stream, &cfg).unwrap();
+        apply_tcp(&stream, &cfg);
     }
 
     #[tokio::test]
     async fn apply_all_options() {
-        let stream = pair().await;
+        let stream = client_stream().await;
         let cfg = ProxyConfig {
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 10,
@@ -113,6 +109,6 @@ mod tests {
             user_timeout_ms: 90_000,
             ..base_cfg()
         };
-        apply_tcp(&stream, &cfg).unwrap();
+        apply_tcp(&stream, &cfg);
     }
 }

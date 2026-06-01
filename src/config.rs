@@ -1,10 +1,36 @@
+//! Proxy configuration: resolved `ProxyConfig`, plus CLI and TOML loaders.
+//!
+//! Default tuning values live in [`defaults`] and nowhere else; both the CLI
+//! (`clap default_value_t`) and the TOML loader reference those constants.
+
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::Path;
 
 use crate::cli::{self, Args};
 
-/// Resolved, ready-to-use proxy configuration.
+/// Built-in default tuning values — the single source of truth.
+pub mod defaults {
+    pub const CONNECT_TIMEOUT_SECS: u64 = 3;
+    pub const KEEPALIVE_IDLE_SECS: u64 = 60;
+    pub const KEEPALIVE_INTERVAL_SECS: u64 = 10;
+    pub const KEEPALIVE_RETRIES: u32 = 6;
+    pub const USER_TIMEOUT_MS: u32 = 90_000;
+    pub const IDLE_TIMEOUT_SECS: u64 = 300;
+    pub const HALF_CLOSE_TIMEOUT_SECS: u64 = 30;
+    pub const SHUTDOWN_GRACE_SECS: u64 = 10;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// Fully resolved configuration for one proxy (no optional fields).
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub name: String,
@@ -20,18 +46,16 @@ pub struct ProxyConfig {
     pub half_close_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    #[default]
-    Tcp,
-    Udp,
-}
+// ── TOML shapes ──────────────────────────────────────────────────────────────
 
-// ── TOML file shape ────────────────────────────────────────────────────────
-
-#[derive(Deserialize, Default)]
-struct TomlDefaults {
+/// Optional tuning knobs. Used for the `[defaults]` table and, field-for-field,
+/// inside each `[[proxy]]`. `None` means "inherit from defaults, then const".
+///
+/// `#[serde(flatten)]` is intentionally NOT used here: it is unreliable for
+/// typed/integer fields with the `toml` crate. Each proxy lists the knobs
+/// explicitly and converts into this struct via [`TomlProxy::tuning`].
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct TomlTuning {
     connect_timeout: Option<u64>,
     keepalive_idle: Option<u64>,
     keepalive_interval: Option<u64>,
@@ -41,9 +65,54 @@ struct TomlDefaults {
     half_close_timeout: Option<u64>,
 }
 
-#[derive(Deserialize)]
+impl TomlTuning {
+    /// Resolve into concrete values: per-proxy override → `[defaults]` → const.
+    fn resolve(self, base: TomlTuning) -> ResolvedTuning {
+        ResolvedTuning {
+            connect_timeout_secs: self
+                .connect_timeout
+                .or(base.connect_timeout)
+                .unwrap_or(defaults::CONNECT_TIMEOUT_SECS),
+            keepalive_idle_secs: self
+                .keepalive_idle
+                .or(base.keepalive_idle)
+                .unwrap_or(defaults::KEEPALIVE_IDLE_SECS),
+            keepalive_interval_secs: self
+                .keepalive_interval
+                .or(base.keepalive_interval)
+                .unwrap_or(defaults::KEEPALIVE_INTERVAL_SECS),
+            keepalive_retries: self
+                .keepalive_retries
+                .or(base.keepalive_retries)
+                .unwrap_or(defaults::KEEPALIVE_RETRIES),
+            user_timeout_ms: self
+                .user_timeout_ms
+                .or(base.user_timeout_ms)
+                .unwrap_or(defaults::USER_TIMEOUT_MS),
+            idle_timeout_secs: self
+                .idle_timeout
+                .or(base.idle_timeout)
+                .unwrap_or(defaults::IDLE_TIMEOUT_SECS),
+            half_close_timeout_secs: self
+                .half_close_timeout
+                .or(base.half_close_timeout)
+                .unwrap_or(defaults::HALF_CLOSE_TIMEOUT_SECS),
+        }
+    }
+}
+
+struct ResolvedTuning {
+    connect_timeout_secs: u64,
+    keepalive_idle_secs: u64,
+    keepalive_interval_secs: u64,
+    keepalive_retries: u32,
+    user_timeout_ms: u32,
+    idle_timeout_secs: u64,
+    half_close_timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct TomlProxy {
-    /// Human-readable label shown in log output
     name: Option<String>,
     listen: String,
     target: String,
@@ -58,17 +127,32 @@ struct TomlProxy {
     half_close_timeout: Option<u64>,
 }
 
-#[derive(Deserialize)]
+impl TomlProxy {
+    fn tuning(&self) -> TomlTuning {
+        TomlTuning {
+            connect_timeout: self.connect_timeout,
+            keepalive_idle: self.keepalive_idle,
+            keepalive_interval: self.keepalive_interval,
+            keepalive_retries: self.keepalive_retries,
+            user_timeout_ms: self.user_timeout_ms,
+            idle_timeout: self.idle_timeout,
+            half_close_timeout: self.half_close_timeout,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct TomlFile {
     #[serde(default)]
-    defaults: TomlDefaults,
+    defaults: TomlTuning,
     #[serde(rename = "proxy")]
     proxies: Vec<TomlProxy>,
 }
 
-// ── Constructors ───────────────────────────────────────────────────────────
+// ── Constructors ─────────────────────────────────────────────────────────────
 
 impl ProxyConfig {
+    /// Build a single-proxy config from CLI args.
     pub fn from_cli(args: &Args) -> Result<Self> {
         let listen = args
             .listen
@@ -79,12 +163,12 @@ impl ProxyConfig {
             .target
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--target required in single-proxy mode"))?;
-        let protocol = parse_protocol(&args.protocol)?;
+
         Ok(Self {
             name: format!("{listen} -> {target}"),
             listen,
             target,
-            protocol,
+            protocol: parse_protocol(&args.protocol)?,
             connect_timeout_secs: args.connect_timeout,
             keepalive_idle_secs: args.keepalive_idle,
             keepalive_interval_secs: args.keepalive_interval,
@@ -94,50 +178,47 @@ impl ProxyConfig {
             half_close_timeout_secs: args.half_close_timeout,
         })
     }
+
+    fn from_toml(index: usize, p: TomlProxy, base: TomlTuning) -> Self {
+        let listen = cli::expand_listen(&p.listen);
+        let name = p
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("proxy-{index}: {listen} -> {}", p.target));
+        let t = p.tuning().resolve(base);
+        Self {
+            name,
+            listen,
+            target: p.target,
+            protocol: p.protocol,
+            connect_timeout_secs: t.connect_timeout_secs,
+            keepalive_idle_secs: t.keepalive_idle_secs,
+            keepalive_interval_secs: t.keepalive_interval_secs,
+            keepalive_retries: t.keepalive_retries,
+            user_timeout_ms: t.user_timeout_ms,
+            idle_timeout_secs: t.idle_timeout_secs,
+            half_close_timeout_secs: t.half_close_timeout_secs,
+        }
+    }
 }
 
+/// Load and resolve every `[[proxy]]` entry from a TOML config file.
 pub fn load(path: &Path) -> Result<Vec<ProxyConfig>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: TomlFile =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
 
-    let d = &file.defaults;
-    let proxies = file
+    if file.proxies.is_empty() {
+        anyhow::bail!("config file defines no [[proxy]] entries");
+    }
+
+    Ok(file
         .proxies
         .into_iter()
         .enumerate()
-        .map(|(i, p)| {
-            let listen = cli::expand_listen(&p.listen);
-            let name = p
-                .name
-                .unwrap_or_else(|| format!("proxy-{i}: {listen} -> {}", p.target));
-            Ok(ProxyConfig {
-                name,
-                listen,
-                target: p.target,
-                protocol: p.protocol,
-                connect_timeout_secs: p.connect_timeout.or(d.connect_timeout).unwrap_or(3),
-                keepalive_idle_secs: p.keepalive_idle.or(d.keepalive_idle).unwrap_or(60),
-                keepalive_interval_secs: p
-                    .keepalive_interval
-                    .or(d.keepalive_interval)
-                    .unwrap_or(10),
-                keepalive_retries: p.keepalive_retries.or(d.keepalive_retries).unwrap_or(6),
-                user_timeout_ms: p.user_timeout_ms.or(d.user_timeout_ms).unwrap_or(90_000),
-                idle_timeout_secs: p.idle_timeout.or(d.idle_timeout).unwrap_or(300),
-                half_close_timeout_secs: p
-                    .half_close_timeout
-                    .or(d.half_close_timeout)
-                    .unwrap_or(30),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    if proxies.is_empty() {
-        anyhow::bail!("config file defines no [[proxy]] entries");
-    }
-    Ok(proxies)
+        .map(|(i, p)| ProxyConfig::from_toml(i, p, file.defaults))
+        .collect())
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol> {
@@ -158,14 +239,14 @@ mod tests {
             listen: listen.map(String::from),
             target: target.map(String::from),
             protocol: protocol.into(),
-            connect_timeout: 3,
-            keepalive_idle: 60,
-            keepalive_interval: 10,
-            keepalive_retries: 6,
-            user_timeout_ms: 90_000,
-            idle_timeout: 300,
-            half_close_timeout: 30,
-            shutdown_grace: 10,
+            connect_timeout: defaults::CONNECT_TIMEOUT_SECS,
+            keepalive_idle: defaults::KEEPALIVE_IDLE_SECS,
+            keepalive_interval: defaults::KEEPALIVE_INTERVAL_SECS,
+            keepalive_retries: defaults::KEEPALIVE_RETRIES,
+            user_timeout_ms: defaults::USER_TIMEOUT_MS,
+            idle_timeout: defaults::IDLE_TIMEOUT_SECS,
+            half_close_timeout: defaults::HALF_CLOSE_TIMEOUT_SECS,
+            shutdown_grace: defaults::SHUTDOWN_GRACE_SECS,
             log_level: "info".into(),
         }
     }
@@ -198,9 +279,9 @@ mod tests {
         assert_eq!(cfg.listen, "0.0.0.0:587");
         assert_eq!(cfg.target, "mail.example.com:587");
         assert_eq!(cfg.protocol, Protocol::Tcp);
-        assert_eq!(cfg.connect_timeout_secs, 3);
-        assert_eq!(cfg.keepalive_idle_secs, 60);
-        assert_eq!(cfg.user_timeout_ms, 90_000);
+        assert_eq!(cfg.connect_timeout_secs, defaults::CONNECT_TIMEOUT_SECS);
+        assert_eq!(cfg.keepalive_idle_secs, defaults::KEEPALIVE_IDLE_SECS);
+        assert_eq!(cfg.user_timeout_ms, defaults::USER_TIMEOUT_MS);
         assert!(cfg.name.contains("0.0.0.0:587"));
         assert!(cfg.name.contains("mail.example.com:587"));
     }
@@ -252,12 +333,14 @@ mod tests {
         assert_eq!(cfgs[0].listen, "127.0.0.1:8080");
         assert_eq!(cfgs[0].target, "127.0.0.1:80");
         assert_eq!(cfgs[0].protocol, Protocol::Tcp);
-        // Defaults applied
-        assert_eq!(cfgs[0].connect_timeout_secs, 3);
-        assert_eq!(cfgs[0].keepalive_idle_secs, 60);
-        assert_eq!(cfgs[0].user_timeout_ms, 90_000);
-        assert_eq!(cfgs[0].idle_timeout_secs, 300);
-        assert_eq!(cfgs[0].half_close_timeout_secs, 30);
+        assert_eq!(cfgs[0].connect_timeout_secs, defaults::CONNECT_TIMEOUT_SECS);
+        assert_eq!(cfgs[0].keepalive_idle_secs, defaults::KEEPALIVE_IDLE_SECS);
+        assert_eq!(cfgs[0].user_timeout_ms, defaults::USER_TIMEOUT_MS);
+        assert_eq!(cfgs[0].idle_timeout_secs, defaults::IDLE_TIMEOUT_SECS);
+        assert_eq!(
+            cfgs[0].half_close_timeout_secs,
+            defaults::HALF_CLOSE_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -300,8 +383,11 @@ mod tests {
         assert_eq!(cfgs[0].keepalive_idle_secs, 120);
         assert_eq!(cfgs[0].idle_timeout_secs, 0);
         assert_eq!(cfgs[0].half_close_timeout_secs, 0);
-        // Untouched defaults stay at built-in
-        assert_eq!(cfgs[0].keepalive_interval_secs, 10);
+        // Untouched knobs fall back to consts
+        assert_eq!(
+            cfgs[0].keepalive_interval_secs,
+            defaults::KEEPALIVE_INTERVAL_SECS
+        );
     }
 
     #[test]

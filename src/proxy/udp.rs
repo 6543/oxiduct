@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -17,6 +16,7 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::clock::now_ms;
 use crate::config::ProxyConfig;
 
 // ── Session ────────────────────────────────────────────────────────────────
@@ -224,13 +224,4 @@ async fn open_session(
         last_activity,
         cancel,
     })
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }

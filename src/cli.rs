@@ -1,5 +1,8 @@
-use clap::Parser;
 use std::path::PathBuf;
+
+use clap::Parser;
+
+use crate::config::defaults;
 
 /// Pipe traffic through oxidized steel — robust TCP/UDP proxy.
 ///
@@ -25,35 +28,35 @@ pub struct Args {
     pub protocol: String,
 
     /// Connect timeout (seconds)
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = defaults::CONNECT_TIMEOUT_SECS)]
     pub connect_timeout: u64,
 
     /// TCP keepalive: idle time before first probe (seconds, 0 = disable)
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = defaults::KEEPALIVE_IDLE_SECS)]
     pub keepalive_idle: u64,
 
     /// TCP keepalive: interval between probes (seconds)
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = defaults::KEEPALIVE_INTERVAL_SECS)]
     pub keepalive_interval: u64,
 
     /// TCP keepalive: max probes before dropping connection
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = defaults::KEEPALIVE_RETRIES)]
     pub keepalive_retries: u32,
 
     /// TCP_USER_TIMEOUT in milliseconds (0 = OS default, Linux/Android only)
-    #[arg(long, default_value_t = 90_000)]
+    #[arg(long, default_value_t = defaults::USER_TIMEOUT_MS)]
     pub user_timeout_ms: u32,
 
     /// Application idle timeout (seconds, 0 = disable)
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = defaults::IDLE_TIMEOUT_SECS)]
     pub idle_timeout: u64,
 
     /// Half-close grace period (seconds, 0 = disable)
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = defaults::HALF_CLOSE_TIMEOUT_SECS)]
     pub half_close_timeout: u64,
 
     /// Grace period on SIGTERM/SIGINT before force-closing connections (seconds)
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = defaults::SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace: u64,
 
     /// Log level — also read from RUST_LOG env var
@@ -61,7 +64,8 @@ pub struct Args {
     pub log_level: String,
 }
 
-/// Expand a bare port number "587" to "0.0.0.0:587"
+/// Expand a bare port number "587" to "0.0.0.0:587". Anything that doesn't
+/// parse as a `u16` is returned unchanged.
 pub fn expand_listen(s: &str) -> String {
     if s.parse::<u16>().is_ok() {
         format!("0.0.0.0:{s}")
@@ -90,8 +94,7 @@ mod tests {
 
     #[test]
     fn expand_passes_through_non_port_input() {
-        // Out of u16 range: not a valid bare port, leave as-is.
-        assert_eq!(expand_listen("65536"), "65536");
+        assert_eq!(expand_listen("65536"), "65536"); // out of u16 range
         assert_eq!(expand_listen("-1"), "-1");
         assert_eq!(expand_listen(""), "");
         assert_eq!(expand_listen("foobar"), "foobar");
@@ -99,7 +102,6 @@ mod tests {
 
     #[test]
     fn expand_zero_port() {
-        // Port 0 = OS-assigned. Legal at the syscall level; we forward as-is.
         assert_eq!(expand_listen("0"), "0.0.0.0:0");
     }
 }
