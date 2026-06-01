@@ -1,0 +1,30 @@
+[package]
+name = "oxiduct"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.71"
+license = "MIT"
+description = "Pipe traffic through oxidized steel — a robust TCP/UDP proxy with dead-connection detection"
+repository = "https://github.com/6543/oxiduct"
+
+[[bin]]
+name = "oxiduct"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = "1"
+clap       = { version = "4.6", features = ["derive", "env"] }
+serde      = { version = "1", features = ["derive"] }
+socket2    = { version = "0.6", features = ["all"] }
+tokio      = { version = "1.51", features = [
+    "rt-multi-thread", "net", "io-util", "macros", "time", "signal", "sync",
+] }
+tokio-util = { version = "0.7" }
+toml       = "0.8"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = true

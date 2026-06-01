@@ -1,0 +1,34 @@
+# oxiduct configuration file
+# All fields in [defaults] are optional; per-proxy values override them.
+
+[defaults]
+connect_timeout    = 3      # seconds
+keepalive_idle     = 60     # seconds
+keepalive_interval = 10     # seconds
+keepalive_retries  = 6
+user_timeout_ms    = 90000  # milliseconds; Linux/Android only; 0 = OS default
+idle_timeout       = 300    # seconds; 0 = disable
+half_close_timeout = 30     # seconds; 0 = disable
+
+# TCP proxy example
+[[proxy]]
+name     = "smtp-submission"
+listen   = "0.0.0.0:587"
+target   = "mail.example.com:587"
+protocol = "tcp"
+
+# UDP proxy example (inherits all defaults)
+[[proxy]]
+name     = "dns-relay"
+listen   = "0.0.0.0:5353"
+target   = "1.1.1.1:53"
+protocol = "udp"
+
+# Per-proxy override example
+[[proxy]]
+name               = "git-ssh"
+listen             = "22"          # expands to 0.0.0.0:22
+target             = "github.com:22"
+protocol           = "tcp"
+idle_timeout       = 3600          # 1h — long-lived git operations
+half_close_timeout = 60

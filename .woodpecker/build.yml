@@ -1,0 +1,25 @@
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+  - event: tag
+    ref: refs/tags/v*
+
+steps:
+  check:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo check --all-targets
+      - cargo test --all-targets
+
+  build-release:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo build --release
+    when:
+      event: tag
+      ref: refs/tags/v*

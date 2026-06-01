@@ -1,0 +1,21 @@
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+
+steps:
+  fmt:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - rustup component add rustfmt
+      - cargo fmt --all -- --check
+
+  clippy:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - rustup component add clippy
+      - cargo clippy --all-targets --all-features -- -D warnings
