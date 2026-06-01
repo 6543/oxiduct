@@ -1,15 +1,13 @@
-mod cli;
-mod config;
-mod proxy;
-mod socket_opts;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use std::sync::Arc;
 use tokio::signal;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+use oxiduct::{cli, config, proxy};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,10 +36,9 @@ async fn main() -> Result<()> {
         handles.push(tokio::spawn(proxy::run(cfg, token)));
     }
 
-    // Wait for SIGINT or SIGTERM
     tokio::select! {
-        _ = signal::ctrl_c()       => info!("received SIGINT"),
-        _ = sigterm()              => info!("received SIGTERM"),
+        _ = signal::ctrl_c() => info!("received SIGINT"),
+        _ = sigterm()        => info!("received SIGTERM"),
     }
 
     let grace = Duration::from_secs(args.shutdown_grace);
@@ -68,7 +65,6 @@ async fn sigterm() {
         .await;
 }
 
-// Windows: SIGTERM doesn't exist; ctrl_c covers it
 #[cfg(not(unix))]
 async fn sigterm() {
     std::future::pending::<()>().await

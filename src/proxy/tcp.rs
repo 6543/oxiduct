@@ -33,7 +33,18 @@ pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<(
         .with_context(|| format!("bind {}", cfg.listen))?;
 
     info!(proxy = %cfg.name, "TCP listening");
+    serve(listener, cfg, shutdown).await
+}
 
+/// Run the accept loop on a pre-bound listener.
+///
+/// Public so integration tests can bind to port 0, observe the assigned port,
+/// then start the proxy on that listener.
+pub async fn serve(
+    listener: TcpListener,
+    cfg: Arc<ProxyConfig>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     loop {
         tokio::select! {
             biased;

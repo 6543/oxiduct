@@ -39,7 +39,18 @@ pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<(
     );
 
     info!(proxy = %cfg.name, "UDP listening");
+    serve(listen_sock, cfg, shutdown).await
+}
 
+/// Run the UDP relay on a pre-bound socket.
+///
+/// Public so integration tests can bind to port 0, observe the assigned port,
+/// then start the proxy on that socket.
+pub async fn serve(
+    listen_sock: Arc<UdpSocket>,
+    cfg: Arc<ProxyConfig>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Cleanup task: evict idle sessions on a 5-second tick
