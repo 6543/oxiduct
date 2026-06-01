@@ -14,10 +14,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
+use crate::limits::{ConnLimits, Guard, Reject};
 
 // ── Session ────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ struct Session {
     last_activity: Arc<AtomicU64>,
     /// Cancels both relay tasks for this session.
     cancel: CancellationToken,
+    /// Holds the limits slot for the duration of this session.
+    _slot: Guard,
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────
@@ -52,6 +55,7 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
+    let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
 
     // Cleanup task: evict idle sessions on a 5-second tick
     if cfg.idle_timeout_secs > 0 {
@@ -104,8 +108,30 @@ pub async fn serve(
                         debug!(%src, "UDP relay channel full, packet dropped");
                     }
                 } else {
-                    // First packet from this source: open a new session
-                    match open_session(src, &cfg, listen_sock.clone(), shutdown.clone()).await {
+                    // First packet from this source: try to admit, then open a session.
+                    let slot = match limits.try_acquire(src.ip()) {
+                        Ok(g) => g,
+                        Err(Reject::Total) => {
+                            error!(
+                                proxy = %cfg.name,
+                                src_ip = %src.ip(),
+                                limit = limits.max_total,
+                                "UDP session rejected: total limit reached"
+                            );
+                            continue;
+                        }
+                        Err(Reject::PerIp) => {
+                            error!(
+                                proxy = %cfg.name,
+                                src_ip = %src.ip(),
+                                limit = limits.max_per_ip,
+                                "UDP session rejected: per-IP limit reached"
+                            );
+                            continue;
+                        }
+                    };
+
+                    match open_session(src, &cfg, listen_sock.clone(), shutdown.clone(), slot).await {
                         Err(e) => warn!(%src, "UDP session open failed: {e:#}"),
                         Ok(session) => {
                             let _ = session.tx.try_send(data);
@@ -126,6 +152,7 @@ async fn open_session(
     cfg: &ProxyConfig,
     listen: Arc<UdpSocket>,
     shutdown: CancellationToken,
+    slot: Guard,
 ) -> Result<Session> {
     // Resolve target to know which IP family to bind the upstream socket to
     let target_addr = tokio::net::lookup_host(&cfg.target)
@@ -223,5 +250,6 @@ async fn open_session(
         tx,
         last_activity,
         cancel,
+        _slot: slot,
     })
 }

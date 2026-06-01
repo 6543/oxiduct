@@ -55,6 +55,14 @@ pub struct Args {
     #[arg(long, default_value_t = defaults::HALF_CLOSE_TIMEOUT_SECS)]
     pub half_close_timeout: u64,
 
+    /// Hard cap on simultaneous connections / UDP sessions per proxy (0 = unlimited)
+    #[arg(long, default_value_t = defaults::MAX_CONNECTIONS)]
+    pub max_connections: u32,
+
+    /// Hard cap on simultaneous connections / UDP sessions per source IP (0 = unlimited)
+    #[arg(long, default_value_t = defaults::MAX_PER_IP)]
+    pub max_per_ip: u32,
+
     /// Grace period on SIGTERM/SIGINT before force-closing connections (seconds)
     #[arg(long, default_value_t = defaults::SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace: u64,

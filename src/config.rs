@@ -20,6 +20,10 @@ pub mod defaults {
     pub const IDLE_TIMEOUT_SECS: u64 = 300;
     pub const HALF_CLOSE_TIMEOUT_SECS: u64 = 30;
     pub const SHUTDOWN_GRACE_SECS: u64 = 10;
+    /// Hard cap on simultaneous connections / UDP sessions per proxy. 0 = unlimited.
+    pub const MAX_CONNECTIONS: u32 = 32_000;
+    /// Hard cap on simultaneous connections / UDP sessions per source IP. 0 = unlimited.
+    pub const MAX_PER_IP: u32 = 320;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -44,6 +48,8 @@ pub struct ProxyConfig {
     pub user_timeout_ms: u32,
     pub idle_timeout_secs: u64,
     pub half_close_timeout_secs: u64,
+    pub max_connections: u32,
+    pub max_per_ip: u32,
 }
 
 // ── TOML shapes ──────────────────────────────────────────────────────────────
@@ -63,6 +69,8 @@ struct TomlTuning {
     user_timeout_ms: Option<u32>,
     idle_timeout: Option<u64>,
     half_close_timeout: Option<u64>,
+    max_connections: Option<u32>,
+    max_per_ip: Option<u32>,
 }
 
 impl TomlTuning {
@@ -97,6 +105,14 @@ impl TomlTuning {
                 .half_close_timeout
                 .or(base.half_close_timeout)
                 .unwrap_or(defaults::HALF_CLOSE_TIMEOUT_SECS),
+            max_connections: self
+                .max_connections
+                .or(base.max_connections)
+                .unwrap_or(defaults::MAX_CONNECTIONS),
+            max_per_ip: self
+                .max_per_ip
+                .or(base.max_per_ip)
+                .unwrap_or(defaults::MAX_PER_IP),
         }
     }
 }
@@ -109,6 +125,8 @@ struct ResolvedTuning {
     user_timeout_ms: u32,
     idle_timeout_secs: u64,
     half_close_timeout_secs: u64,
+    max_connections: u32,
+    max_per_ip: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +143,8 @@ struct TomlProxy {
     user_timeout_ms: Option<u32>,
     idle_timeout: Option<u64>,
     half_close_timeout: Option<u64>,
+    max_connections: Option<u32>,
+    max_per_ip: Option<u32>,
 }
 
 impl TomlProxy {
@@ -137,6 +157,8 @@ impl TomlProxy {
             user_timeout_ms: self.user_timeout_ms,
             idle_timeout: self.idle_timeout,
             half_close_timeout: self.half_close_timeout,
+            max_connections: self.max_connections,
+            max_per_ip: self.max_per_ip,
         }
     }
 }
@@ -176,6 +198,8 @@ impl ProxyConfig {
             user_timeout_ms: args.user_timeout_ms,
             idle_timeout_secs: args.idle_timeout,
             half_close_timeout_secs: args.half_close_timeout,
+            max_connections: args.max_connections,
+            max_per_ip: args.max_per_ip,
         })
     }
 
@@ -198,6 +222,8 @@ impl ProxyConfig {
             user_timeout_ms: t.user_timeout_ms,
             idle_timeout_secs: t.idle_timeout_secs,
             half_close_timeout_secs: t.half_close_timeout_secs,
+            max_connections: t.max_connections,
+            max_per_ip: t.max_per_ip,
         }
     }
 }
@@ -246,6 +272,8 @@ mod tests {
             user_timeout_ms: defaults::USER_TIMEOUT_MS,
             idle_timeout: defaults::IDLE_TIMEOUT_SECS,
             half_close_timeout: defaults::HALF_CLOSE_TIMEOUT_SECS,
+            max_connections: defaults::MAX_CONNECTIONS,
+            max_per_ip: defaults::MAX_PER_IP,
             shutdown_grace: defaults::SHUTDOWN_GRACE_SECS,
             log_level: "info".into(),
         }

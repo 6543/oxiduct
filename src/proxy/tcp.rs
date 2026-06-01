@@ -16,10 +16,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
+use crate::limits::{ConnLimits, Reject};
 use crate::socket_opts;
 
 /// Relay buffer size, per direction.
@@ -68,6 +69,8 @@ pub async fn serve(
     cfg: Arc<ProxyConfig>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
+
     loop {
         tokio::select! {
             biased;
@@ -77,10 +80,37 @@ pub async fn serve(
             }
             result = listener.accept() => match result {
                 Ok((stream, peer)) => {
+                    let guard = match limits.try_acquire(peer.ip()) {
+                        Ok(g) => g,
+                        Err(Reject::Total) => {
+                            error!(
+                                proxy = %cfg.name,
+                                src_ip = %peer.ip(),
+                                limit = limits.max_total,
+                                "TCP connection rejected: total limit reached"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        Err(Reject::PerIp) => {
+                            error!(
+                                proxy = %cfg.name,
+                                src_ip = %peer.ip(),
+                                limit = limits.max_per_ip,
+                                "TCP connection rejected: per-IP limit reached"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
                     let cfg = cfg.clone();
                     let token = shutdown.child_token();
-                    tokio::spawn(async move { handle(id, stream, peer, cfg, token).await });
+                    tokio::spawn(async move {
+                        let _guard = guard; // released on task end
+                        handle(id, stream, peer, cfg, token).await
+                    });
                 }
                 Err(e) => warn!(proxy = %cfg.name, "accept error: {e}"), // non-fatal
             }
