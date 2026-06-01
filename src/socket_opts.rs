@@ -43,3 +43,76 @@ pub fn apply_tcp(stream: &TcpStream, cfg: &ProxyConfig) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply_tcp;
+    use crate::config::{Protocol, ProxyConfig};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn base_cfg() -> ProxyConfig {
+        ProxyConfig {
+            name: "test".into(),
+            listen: "127.0.0.1:0".into(),
+            target: "127.0.0.1:0".into(),
+            protocol: Protocol::Tcp,
+            connect_timeout_secs: 3,
+            keepalive_idle_secs: 0,
+            keepalive_interval_secs: 0,
+            keepalive_retries: 0,
+            user_timeout_ms: 0,
+            idle_timeout_secs: 0,
+            half_close_timeout_secs: 0,
+        }
+    }
+
+    async fn pair() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, _server) =
+            tokio::join!(TcpStream::connect(addr), async { listener.accept().await });
+        client.unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_all_disabled_succeeds() {
+        let stream = pair().await;
+        apply_tcp(&stream, &base_cfg()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_with_keepalive() {
+        let stream = pair().await;
+        let cfg = ProxyConfig {
+            keepalive_idle_secs: 60,
+            keepalive_interval_secs: 10,
+            keepalive_retries: 6,
+            ..base_cfg()
+        };
+        apply_tcp(&stream, &cfg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_with_user_timeout() {
+        let stream = pair().await;
+        let cfg = ProxyConfig {
+            user_timeout_ms: 30_000,
+            ..base_cfg()
+        };
+        // On Linux this sets TCP_USER_TIMEOUT; on other OSes it's a no-op.
+        apply_tcp(&stream, &cfg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_all_options() {
+        let stream = pair().await;
+        let cfg = ProxyConfig {
+            keepalive_idle_secs: 60,
+            keepalive_interval_secs: 10,
+            keepalive_retries: 6,
+            user_timeout_ms: 90_000,
+            ..base_cfg()
+        };
+        apply_tcp(&stream, &cfg).unwrap();
+    }
+}

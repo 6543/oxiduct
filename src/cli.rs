@@ -69,3 +69,37 @@ pub fn expand_listen(s: &str) -> String {
         s.to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::expand_listen;
+
+    #[test]
+    fn expand_bare_port() {
+        assert_eq!(expand_listen("587"), "0.0.0.0:587");
+        assert_eq!(expand_listen("1"), "0.0.0.0:1");
+        assert_eq!(expand_listen("65535"), "0.0.0.0:65535");
+    }
+
+    #[test]
+    fn expand_passes_through_full_addr() {
+        assert_eq!(expand_listen("127.0.0.1:80"), "127.0.0.1:80");
+        assert_eq!(expand_listen("0.0.0.0:443"), "0.0.0.0:443");
+        assert_eq!(expand_listen("[::1]:80"), "[::1]:80");
+    }
+
+    #[test]
+    fn expand_passes_through_non_port_input() {
+        // Out of u16 range: not a valid bare port, leave as-is.
+        assert_eq!(expand_listen("65536"), "65536");
+        assert_eq!(expand_listen("-1"), "-1");
+        assert_eq!(expand_listen(""), "");
+        assert_eq!(expand_listen("foobar"), "foobar");
+    }
+
+    #[test]
+    fn expand_zero_port() {
+        // Port 0 = OS-assigned. Legal at the syscall level; we forward as-is.
+        assert_eq!(expand_listen("0"), "0.0.0.0:0");
+    }
+}
