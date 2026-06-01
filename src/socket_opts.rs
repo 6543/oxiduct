@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Apply socket-level liveness options to TCP streams.
 //!
 //! Layers applied:

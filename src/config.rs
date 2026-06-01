@@ -4,7 +4,6 @@ use std::path::Path;
 
 use crate::cli::{self, Args};
 
-#[allow(dead_code)]
 /// Resolved, ready-to-use proxy configuration.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
