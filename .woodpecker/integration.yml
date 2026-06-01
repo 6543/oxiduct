@@ -1,0 +1,24 @@
+# Integration test workflow.
+#
+# All test infrastructure is in-process (tokio tasks on OS-assigned loopback
+# ports), so no external services are required.
+#
+# Some tests exercise real wall-clock timeouts (idle, half-close, connect).
+# The suite may take up to ~90s; this is expected.
+
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+
+steps:
+  integration:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+      # Print individual test names so a timeout gives a clear last-seen line.
+      RUST_TEST_NOCAPTURE: "0"
+    commands:
+      # Only integration tests (tests/ directory), not unit tests (already
+      # covered by the build workflow).
+      - cargo test --tests -- --test-threads 4

@@ -12,7 +12,8 @@ steps:
       CARGO_TERM_COLOR: always
     commands:
       - cargo check --all-targets
-      - cargo test --all-targets
+      # Unit tests only; integration tests run in the dedicated integration workflow.
+      - cargo test --lib
 
   build-release:
     image: rust:latest
