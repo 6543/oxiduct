@@ -6,6 +6,9 @@ rust-version = "1.71"
 license = "MIT"
 description = "Pipe traffic through oxidized steel — a robust TCP/UDP proxy with dead-connection detection"
 repository = "https://github.com/6543/oxiduct"
+readme = "README.md"
+keywords = ["proxy", "tcp", "udp", "network", "socat"]
+categories = ["network-programming", "command-line-utilities"]
 
 [lib]
 name = "oxiduct"

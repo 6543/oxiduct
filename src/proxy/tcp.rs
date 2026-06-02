@@ -105,7 +105,7 @@ pub async fn serve(
                                 "TCP connection rejected: total limit reached"
                             );
                             metrics.connections_rejected
-                                .with_label_values(&[&cfg.name, "total"]).inc();
+                                .with_label_values(&[cfg.name.as_str(), "total"]).inc();
                             drop(stream);
                             continue;
                         }
@@ -117,14 +117,14 @@ pub async fn serve(
                                 "TCP connection rejected: per-IP limit reached"
                             );
                             metrics.connections_rejected
-                                .with_label_values(&[&cfg.name, "per_ip"]).inc();
+                                .with_label_values(&[cfg.name.as_str(), "per_ip"]).inc();
                             drop(stream);
                             continue;
                         }
                     };
 
                     metrics.connections_total
-                        .with_label_values(&[&cfg.name, "tcp"]).inc();
+                        .with_label_values(&[cfg.name.as_str(), "tcp"]).inc();
 
                     let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
                     let cfg = cfg.clone();
@@ -165,7 +165,7 @@ async fn handle(
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
             metrics
                 .connect_failures
-                .with_label_values(&[&cfg.name])
+                .with_label_values(&[cfg.name.as_str()])
                 .inc();
             return;
         }
@@ -173,7 +173,7 @@ async fn handle(
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
             metrics
                 .connect_timeouts
-                .with_label_values(&[&cfg.name])
+                .with_label_values(&[cfg.name.as_str()])
                 .inc();
             return;
         }
@@ -184,7 +184,7 @@ async fn handle(
     info!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connected");
 
     // Active gauge: up for the lifetime of the relay, down on any exit path.
-    let active = metrics.active.with_label_values(&[&cfg.name]);
+    let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
     active.inc();
     relay(id, peer, inbound, outbound, &cfg, &metrics, shutdown).await;
     active.dec();
@@ -210,8 +210,12 @@ async fn relay(
     let cancel = CancellationToken::new();
     let (done_tx, done_rx) = mpsc::channel::<(Dir, End)>(2);
 
-    let bytes_up_ctr = metrics.bytes_total.with_label_values(&[&cfg.name, "up"]);
-    let bytes_down_ctr = metrics.bytes_total.with_label_values(&[&cfg.name, "down"]);
+    let bytes_up_ctr = metrics
+        .bytes_total
+        .with_label_values(&[cfg.name.as_str(), "up"]);
+    let bytes_down_ctr = metrics
+        .bytes_total
+        .with_label_values(&[cfg.name.as_str(), "down"]);
 
     let h_up = tokio::spawn(copy_dir(
         id,
@@ -251,7 +255,7 @@ async fn relay(
 
     metrics
         .connections_closed
-        .with_label_values(&[&cfg.name, reason])
+        .with_label_values(&[cfg.name.as_str(), reason])
         .inc();
 
     info!(proxy = %cfg.name, id, %peer, target = %cfg.target, bytes_up, bytes_down, reason, "connection closed");

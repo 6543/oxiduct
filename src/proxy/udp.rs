@@ -62,7 +62,7 @@ pub async fn serve(
 ) -> Result<()> {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
-    let active = metrics.active.with_label_values(&[&cfg.name]);
+    let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
 
     // Cleanup task: evict idle sessions on a 5-second tick
     if cfg.idle_timeout_secs > 0 {
@@ -71,7 +71,7 @@ pub async fn serve(
         let shut = shutdown.clone();
         let closed = metrics
             .connections_closed
-            .with_label_values(&[&cfg.name, "idle_timeout"]);
+            .with_label_values(&[cfg.name.as_str(), "idle_timeout"]);
         let active2 = active.clone();
         tokio::spawn(async move {
             loop {
@@ -110,7 +110,7 @@ pub async fn serve(
                 }
                 let closed = metrics
                     .connections_closed
-                    .with_label_values(&[&cfg.name, "shutdown"]);
+                    .with_label_values(&[cfg.name.as_str(), "shutdown"]);
                 closed.inc_by(map.len() as u64);
                 active.set(0);
                 break;
@@ -156,7 +156,7 @@ pub async fn serve(
                             "UDP session rejected: total limit reached"
                         );
                         metrics.connections_rejected
-                            .with_label_values(&[&cfg.name, "total"]).inc();
+                            .with_label_values(&[cfg.name.as_str(), "total"]).inc();
                         continue;
                     }
                     Err(Reject::PerIp) => {
@@ -167,7 +167,7 @@ pub async fn serve(
                             "UDP session rejected: per-IP limit reached"
                         );
                         metrics.connections_rejected
-                            .with_label_values(&[&cfg.name, "per_ip"]).inc();
+                            .with_label_values(&[cfg.name.as_str(), "per_ip"]).inc();
                         continue;
                     }
                 };
@@ -192,7 +192,7 @@ pub async fn serve(
                     let _ = session.tx.try_send(data);
                     map.insert(src, session);
                     metrics.connections_total
-                        .with_label_values(&[&cfg.name, "udp"]).inc();
+                        .with_label_values(&[cfg.name.as_str(), "udp"]).inc();
                     active.set(map.len() as i64);
                 }
             }
@@ -244,8 +244,12 @@ async fn open_session(
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let cancel = CancellationToken::new();
 
-    let bytes_up = metrics.bytes_total.with_label_values(&[&cfg.name, "up"]);
-    let bytes_down = metrics.bytes_total.with_label_values(&[&cfg.name, "down"]);
+    let bytes_up = metrics
+        .bytes_total
+        .with_label_values(&[cfg.name.as_str(), "up"]);
+    let bytes_down = metrics
+        .bytes_total
+        .with_label_values(&[cfg.name.as_str(), "down"]);
 
     // ── client → upstream ─────────────────────────────────────────────────
     {
