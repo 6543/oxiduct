@@ -50,6 +50,8 @@ oxiduct --listen 5353 --target 1.1.1.1:53 --protocol udp
 | `--user-timeout-ms` | 90000 | `TCP_USER_TIMEOUT` (ms, Linux only) |
 | `--idle-timeout` | 300 | App idle timeout (s, 0=off) |
 | `--half-close-timeout` | 30 | Half-close grace (s, 0=off) |
+| `--max-connections` | 32000 | Max simultaneous connections per proxy (0=off) |
+| `--max-per-ip` | 320 | Max simultaneous connections per source IP (0=off) |
 | `--shutdown-grace` | 10 | SIGTERM grace period (s) |
 | `--log-level` | info | Tracing level / `RUST_LOG` |
 
@@ -139,6 +141,8 @@ keepalive_retries  = 6
 user_timeout_ms    = 90000   # Linux/Android; 0 = OS default
 idle_timeout       = 300     # seconds; 0 = disable
 half_close_timeout = 30      # seconds; 0 = disable
+max_connections    = 32000   # total cap; 0 = unlimited
+max_per_ip         = 320     # per-source-IP cap; 0 = unlimited
 
 [[proxy]]
 name     = "smtp-submission"
@@ -169,10 +173,6 @@ oxiduct --config config.toml
 ```
 
 See [`contrib/example.toml`](contrib/example.toml) for the version that ships with the repo.
-
-## NixOS
-
-NixOS module is planned (`contrib/nixos/`).
 
 ## License
 
