@@ -1,0 +1,21 @@
+# Dependency vulnerability audit using cargo-audit.
+#
+# Runs on:
+#   - every push / PR (catches new deps immediately)
+#   - cron (schedule configured in the Woodpecker UI — catches newly
+#     published advisories against the existing locked dependency set)
+
+when:
+  - event: pull_request
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+  - event: cron
+
+steps:
+  audit:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo install cargo-audit --locked --quiet
+      - cargo audit
