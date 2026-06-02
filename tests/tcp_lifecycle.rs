@@ -77,7 +77,12 @@ async fn bind_failure_returns_error() {
     cfg.listen = addr.to_string(); // already taken
 
     // Call run() (NOT serve) to exercise the bind path
-    let result = oxiduct::proxy::tcp::run(Arc::new(cfg), CancellationToken::new()).await;
+    let result = oxiduct::proxy::tcp::run(
+        Arc::new(cfg),
+        oxiduct::metrics::Metrics::new(),
+        CancellationToken::new(),
+    )
+    .await;
     assert!(result.is_err(), "expected bind failure, got {result:?}");
 
     drop(blocker);

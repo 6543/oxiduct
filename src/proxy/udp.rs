@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
 use crate::limits::{ConnLimits, Guard, Reject};
+use crate::metrics::Metrics;
 
 // ── Session ────────────────────────────────────────────────────────────────
 
@@ -34,7 +35,11 @@ struct Session {
 
 // ── Main loop ──────────────────────────────────────────────────────────────
 
-pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<()> {
+pub async fn run(
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listen_sock = Arc::new(
         UdpSocket::bind(&cfg.listen)
             .await
@@ -42,7 +47,7 @@ pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<(
     );
 
     info!(proxy = %cfg.name, "UDP listening");
-    serve(listen_sock, cfg, shutdown).await
+    serve(listen_sock, cfg, metrics, shutdown).await
 }
 
 /// Run the UDP relay on a pre-bound socket.
@@ -52,16 +57,22 @@ pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<(
 pub async fn serve(
     listen_sock: Arc<UdpSocket>,
     cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
+    let active = metrics.active.with_label_values(&[&cfg.name]);
 
     // Cleanup task: evict idle sessions on a 5-second tick
     if cfg.idle_timeout_secs > 0 {
         let sessions2 = sessions.clone();
         let idle_secs = cfg.idle_timeout_secs;
         let shut = shutdown.clone();
+        let closed = metrics
+            .connections_closed
+            .with_label_values(&[&cfg.name, "idle_timeout"]);
+        let active2 = active.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -69,15 +80,18 @@ pub async fn serve(
                     _ = sleep(Duration::from_secs(5)) => {}
                 }
                 let now = now_ms();
-                sessions2.lock().await.retain(|src, s| {
+                let mut map = sessions2.lock().await;
+                map.retain(|src, s| {
                     let last = s.last_activity.load(Ordering::Relaxed);
                     let stale = now.saturating_sub(last) >= idle_secs * 1000;
                     if stale {
                         debug!(%src, "UDP session idle timeout");
                         s.cancel.cancel();
+                        closed.inc();
                     }
                     !stale
                 });
+                active2.set(map.len() as i64);
             }
         });
     }
@@ -90,9 +104,15 @@ pub async fn serve(
             _ = shutdown.cancelled() => {
                 info!(proxy = %cfg.name, "UDP listener shutting down");
                 // Cancel all live sessions
-                for s in sessions.lock().await.values() {
+                let map = sessions.lock().await;
+                for s in map.values() {
                     s.cancel.cancel();
                 }
+                let closed = metrics
+                    .connections_closed
+                    .with_label_values(&[&cfg.name, "shutdown"]);
+                closed.inc_by(map.len() as u64);
+                active.set(0);
                 break;
             }
             result = listen_sock.recv_from(&mut recv_buf) => {
@@ -118,6 +138,8 @@ pub async fn serve(
                                 limit = limits.max_total,
                                 "UDP session rejected: total limit reached"
                             );
+                            metrics.connections_rejected
+                                .with_label_values(&[&cfg.name, "total"]).inc();
                             continue;
                         }
                         Err(Reject::PerIp) => {
@@ -127,15 +149,20 @@ pub async fn serve(
                                 limit = limits.max_per_ip,
                                 "UDP session rejected: per-IP limit reached"
                             );
+                            metrics.connections_rejected
+                                .with_label_values(&[&cfg.name, "per_ip"]).inc();
                             continue;
                         }
                     };
 
-                    match open_session(src, &cfg, listen_sock.clone(), shutdown.clone(), slot).await {
+                    match open_session(src, &cfg, &metrics, listen_sock.clone(), shutdown.clone(), slot).await {
                         Err(e) => warn!(%src, "UDP session open failed: {e:#}"),
                         Ok(session) => {
                             let _ = session.tx.try_send(data);
                             map.insert(src, session);
+                            metrics.connections_total
+                                .with_label_values(&[&cfg.name, "udp"]).inc();
+                            active.set(map.len() as i64);
                         }
                     }
                 }
@@ -150,6 +177,7 @@ pub async fn serve(
 async fn open_session(
     src: SocketAddr,
     cfg: &ProxyConfig,
+    metrics: &Metrics,
     listen: Arc<UdpSocket>,
     shutdown: CancellationToken,
     slot: Guard,
@@ -187,12 +215,16 @@ async fn open_session(
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let cancel = CancellationToken::new();
 
+    let bytes_up = metrics.bytes_total.with_label_values(&[&cfg.name, "up"]);
+    let bytes_down = metrics.bytes_total.with_label_values(&[&cfg.name, "down"]);
+
     // ── client → upstream ─────────────────────────────────────────────────
     {
         let up = upstream.clone();
         let la = last_activity.clone();
         let c = cancel.clone();
         let s = shutdown.clone();
+        let bytes_up = bytes_up.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -203,9 +235,12 @@ async fn open_session(
                         None => break,
                         Some(d) => {
                             la.store(now_ms(), Ordering::Relaxed);
-                            if let Err(e) = up.send(&d).await {
-                                debug!(%src, "UDP send upstream: {e}");
-                                break;
+                            match up.send(&d).await {
+                                Ok(n) => bytes_up.inc_by(n as u64),
+                                Err(e) => {
+                                    debug!(%src, "UDP send upstream: {e}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -220,6 +255,7 @@ async fn open_session(
         let la = last_activity.clone();
         let c = cancel.clone();
         let s = shutdown.clone();
+        let bytes_down = bytes_down.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
@@ -234,9 +270,12 @@ async fn open_session(
                         }
                         Ok(n) => {
                             la.store(now_ms(), Ordering::Relaxed);
-                            if let Err(e) = listen.send_to(&buf[..n], src).await {
-                                debug!(%src, "UDP send client: {e}");
-                                break;
+                            match listen.send_to(&buf[..n], src).await {
+                                Ok(sent) => bytes_down.inc_by(sent as u64),
+                                Err(e) => {
+                                    debug!(%src, "UDP send client: {e}");
+                                    break;
+                                }
                             }
                         }
                     }

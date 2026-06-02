@@ -1,6 +1,10 @@
 # oxiduct configuration file
 # All fields in [defaults] are optional; per-proxy values override them.
 
+# Optional: expose Prometheus metrics at GET /metrics on this address.
+# Comment out to disable the exporter.
+metrics_listen = "127.0.0.1:9090"
+
 [defaults]
 connect_timeout    = 3      # seconds
 keepalive_idle     = 60     # seconds

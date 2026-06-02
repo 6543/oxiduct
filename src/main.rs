@@ -7,7 +7,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use oxiduct::{cli, config, proxy};
+use oxiduct::{cli, config, metrics, proxy};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,14 +20,30 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let proxies: Vec<config::ProxyConfig> = if let Some(ref path) = args.config {
-        config::load(path)?
+    // Resolve proxies + the global metrics address. CLI --metrics-listen wins
+    // over the TOML metrics_listen key.
+    let (proxies, metrics_listen) = if let Some(ref path) = args.config {
+        let loaded = config::load(path)?;
+        let addr = args.metrics_listen.clone().or(loaded.metrics_listen);
+        (loaded.proxies, addr)
     } else {
-        vec![config::ProxyConfig::from_cli(&args)?]
+        (
+            vec![config::ProxyConfig::from_cli(&args)?],
+            args.metrics_listen.clone(),
+        )
     };
 
     let shutdown = CancellationToken::new();
-    let mut handles = Vec::with_capacity(proxies.len());
+    let stats = metrics::Metrics::new();
+    let mut handles = Vec::with_capacity(proxies.len() + 1);
+
+    // Optional Prometheus exporter. Treated like a proxy task: if it fails to
+    // bind, startup aborts with a non-zero exit.
+    if let Some(addr) = metrics_listen {
+        let stats = stats.clone();
+        let token = shutdown.clone();
+        handles.push(tokio::spawn(metrics::serve(addr, stats, token)));
+    }
 
     for cfg in proxies {
         let cfg = Arc::new(cfg);
@@ -42,7 +58,7 @@ async fn main() -> Result<()> {
             "resolved config"
         );
         let token = shutdown.clone();
-        handles.push(tokio::spawn(proxy::run(cfg, token)));
+        handles.push(tokio::spawn(proxy::run(cfg, stats.clone(), token)));
     }
 
     tokio::select! {

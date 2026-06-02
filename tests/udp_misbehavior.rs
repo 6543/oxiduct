@@ -62,7 +62,12 @@ async fn bind_already_in_use_returns_error() {
     let mut cfg = cfg_udp("127.0.0.1:1".parse().unwrap());
     cfg.listen = addr.to_string();
 
-    let result = oxiduct::proxy::udp::run(Arc::new(cfg), CancellationToken::new()).await;
+    let result = oxiduct::proxy::udp::run(
+        Arc::new(cfg),
+        oxiduct::metrics::Metrics::new(),
+        CancellationToken::new(),
+    )
+    .await;
     assert!(result.is_err(), "expected bind failure, got {result:?}");
 
     drop(blocker);

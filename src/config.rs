@@ -167,8 +167,17 @@ impl TomlProxy {
 struct TomlFile {
     #[serde(default)]
     defaults: TomlTuning,
+    /// Optional global Prometheus exporter address.
+    metrics_listen: Option<String>,
     #[serde(rename = "proxy")]
     proxies: Vec<TomlProxy>,
+}
+
+/// Result of loading a config file: the proxies plus global settings.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub proxies: Vec<ProxyConfig>,
+    pub metrics_listen: Option<String>,
 }
 
 // ── Constructors ─────────────────────────────────────────────────────────────
@@ -229,7 +238,7 @@ impl ProxyConfig {
 }
 
 /// Load and resolve every `[[proxy]]` entry from a TOML config file.
-pub fn load(path: &Path) -> Result<Vec<ProxyConfig>> {
+pub fn load(path: &Path) -> Result<LoadedConfig> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: TomlFile =
@@ -239,12 +248,18 @@ pub fn load(path: &Path) -> Result<Vec<ProxyConfig>> {
         anyhow::bail!("config file defines no [[proxy]] entries");
     }
 
-    Ok(file
+    let metrics_listen = file.metrics_listen.clone();
+    let proxies = file
         .proxies
         .into_iter()
         .enumerate()
         .map(|(i, p)| ProxyConfig::from_toml(i, p, file.defaults))
-        .collect())
+        .collect();
+
+    Ok(LoadedConfig {
+        proxies,
+        metrics_listen,
+    })
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol> {
@@ -275,6 +290,7 @@ mod tests {
             max_connections: defaults::MAX_CONNECTIONS,
             max_per_ip: defaults::MAX_PER_IP,
             shutdown_grace: defaults::SHUTDOWN_GRACE_SECS,
+            metrics_listen: None,
             log_level: "info".into(),
         }
     }
@@ -344,7 +360,41 @@ mod tests {
     fn load_str(s: &str) -> Result<Vec<ProxyConfig>> {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), s).unwrap();
-        load(f.path())
+        load(f.path()).map(|c| c.proxies)
+    }
+
+    #[test]
+    fn load_metrics_listen_present() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            metrics_listen = "127.0.0.1:9090"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.metrics_listen.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(loaded.proxies.len(), 1);
+    }
+
+    #[test]
+    fn load_metrics_listen_absent() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.metrics_listen, None);
     }
 
     #[test]

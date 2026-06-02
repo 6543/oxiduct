@@ -170,6 +170,7 @@ pub async fn spawn_tcp_proxy(cfg: ProxyConfig) -> ProxyHandle {
     let task = tokio::spawn(oxiduct::proxy::tcp::serve(
         listener,
         Arc::new(cfg),
+        oxiduct::metrics::Metrics::new(),
         shutdown.clone(),
     ));
     // Yield so the accept loop can start polling
@@ -188,6 +189,7 @@ pub async fn spawn_udp_proxy(cfg: ProxyConfig) -> ProxyHandle {
     let task = tokio::spawn(oxiduct::proxy::udp::serve(
         socket,
         Arc::new(cfg),
+        oxiduct::metrics::Metrics::new(),
         shutdown.clone(),
     ));
     tokio::task::yield_now().await;

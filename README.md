@@ -53,6 +53,7 @@ oxiduct --listen 5353 --target 1.1.1.1:53 --protocol udp
 | `--max-connections` | 32000 | Max simultaneous connections per proxy (0=off) |
 | `--max-per-ip` | 320 | Max simultaneous connections per source IP (0=off) |
 | `--shutdown-grace` | 10 | SIGTERM grace period (s) |
+| `--metrics-listen` | (off) | Serve Prometheus metrics at GET /metrics on this address |
 | `--log-level` | info | Tracing level / `RUST_LOG` |
 
 ## Demo / local testing
@@ -173,6 +174,34 @@ oxiduct --config config.toml
 ```
 
 See [`contrib/example.toml`](contrib/example.toml) for the version that ships with the repo.
+
+## Metrics
+
+oxiduct can expose Prometheus metrics for monitoring, alerting and security
+auditing. Enable the exporter with `--metrics-listen` (CLI) or `metrics_listen`
+(TOML, top level):
+
+```sh
+oxiduct --listen 587 --target mail.example.com:587 --metrics-listen 127.0.0.1:9090
+curl http://127.0.0.1:9090/metrics
+```
+
+Exposed series (all labelled by `proxy`):
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `oxiduct_connections_total` | counter | proxy, protocol | Connections accepted / UDP sessions opened |
+| `oxiduct_connections_rejected_total` | counter | proxy, reason | Refused by the limiter (`total` / `per_ip`) |
+| `oxiduct_connect_failures_total` | counter | proxy | Upstream TCP connect failures |
+| `oxiduct_connect_timeouts_total` | counter | proxy | Upstream TCP connect timeouts |
+| `oxiduct_bytes_total` | counter | proxy, direction | Bytes relayed (`up` / `down`), updated live |
+| `oxiduct_connections_closed_total` | counter | proxy, reason | Closes by reason (`eof`/`reset`/`idle_timeout`/`half_close_timeout`/`shutdown`) |
+| `oxiduct_active_connections` | gauge | proxy | Currently active connections / sessions |
+| `oxiduct_max_connections` | gauge | proxy | Configured total cap (0 = unlimited) |
+| `oxiduct_max_per_ip` | gauge | proxy | Configured per-IP cap (0 = unlimited) |
+
+Throughput is derived in Prometheus with `rate(oxiduct_bytes_total[1m])`.
+Source IPs are deliberately not used as labels to bound series cardinality.
 
 ## License
 

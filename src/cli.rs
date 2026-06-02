@@ -72,6 +72,11 @@ pub struct Args {
     #[arg(long, default_value_t = defaults::SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace: u64,
 
+    /// Serve Prometheus metrics at GET /metrics on this address (e.g. 127.0.0.1:9090).
+    /// Unset = exporter disabled.
+    #[arg(long)]
+    pub metrics_listen: Option<String>,
+
     /// Log level — also read from RUST_LOG env var
     #[arg(long, default_value = "info", env = "RUST_LOG")]
     pub log_level: String,

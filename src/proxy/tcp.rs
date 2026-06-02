@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
 use crate::limits::{ConnLimits, Reject};
+use crate::metrics::Metrics;
 use crate::socket_opts;
 
 /// Relay buffer size, per direction.
@@ -60,13 +61,17 @@ enum End {
 
 // ── Accept loop ──────────────────────────────────────────────────────────────
 
-pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<()> {
+pub async fn run(
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
 
     info!(proxy = %cfg.name, "TCP listening");
-    serve(listener, cfg, shutdown).await
+    serve(listener, cfg, metrics, shutdown).await
 }
 
 /// Run the accept loop on a pre-bound listener.
@@ -76,6 +81,7 @@ pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<(
 pub async fn serve(
     listener: TcpListener,
     cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
@@ -98,6 +104,8 @@ pub async fn serve(
                                 limit = limits.max_total,
                                 "TCP connection rejected: total limit reached"
                             );
+                            metrics.connections_rejected
+                                .with_label_values(&[&cfg.name, "total"]).inc();
                             drop(stream);
                             continue;
                         }
@@ -108,17 +116,23 @@ pub async fn serve(
                                 limit = limits.max_per_ip,
                                 "TCP connection rejected: per-IP limit reached"
                             );
+                            metrics.connections_rejected
+                                .with_label_values(&[&cfg.name, "per_ip"]).inc();
                             drop(stream);
                             continue;
                         }
                     };
 
+                    metrics.connections_total
+                        .with_label_values(&[&cfg.name, "tcp"]).inc();
+
                     let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
                     let cfg = cfg.clone();
+                    let metrics = metrics.clone();
                     let token = shutdown.child_token();
                     tokio::spawn(async move {
                         let _guard = guard; // released on task end
-                        handle(id, stream, peer, cfg, token).await
+                        handle(id, stream, peer, cfg, metrics, token).await
                     });
                 }
                 Err(e) => warn!(proxy = %cfg.name, "accept error: {e}"), // non-fatal
@@ -135,6 +149,7 @@ async fn handle(
     inbound: TcpStream,
     peer: SocketAddr,
     cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
     socket_opts::apply_tcp(&inbound, &cfg);
@@ -148,10 +163,18 @@ async fn handle(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
+            metrics
+                .connect_failures
+                .with_label_values(&[&cfg.name])
+                .inc();
             return;
         }
         Err(_) => {
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
+            metrics
+                .connect_timeouts
+                .with_label_values(&[&cfg.name])
+                .inc();
             return;
         }
     };
@@ -159,7 +182,12 @@ async fn handle(
     socket_opts::apply_tcp(&outbound, &cfg);
 
     info!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connected");
-    relay(id, peer, inbound, outbound, &cfg, shutdown).await;
+
+    // Active gauge: up for the lifetime of the relay, down on any exit path.
+    let active = metrics.active.with_label_values(&[&cfg.name]);
+    active.inc();
+    relay(id, peer, inbound, outbound, &cfg, &metrics, shutdown).await;
+    active.dec();
 }
 
 // ── Bidirectional relay ──────────────────────────────────────────────────────
@@ -170,6 +198,7 @@ async fn relay(
     inbound: TcpStream,
     outbound: TcpStream,
     cfg: &ProxyConfig,
+    metrics: &Metrics,
     shutdown: CancellationToken,
 ) {
     let (ir, iw) = inbound.into_split();
@@ -181,6 +210,9 @@ async fn relay(
     let cancel = CancellationToken::new();
     let (done_tx, done_rx) = mpsc::channel::<(Dir, End)>(2);
 
+    let bytes_up_ctr = metrics.bytes_total.with_label_values(&[&cfg.name, "up"]);
+    let bytes_down_ctr = metrics.bytes_total.with_label_values(&[&cfg.name, "down"]);
+
     let h_up = tokio::spawn(copy_dir(
         id,
         Dir::Up,
@@ -189,6 +221,7 @@ async fn relay(
         last_activity.clone(),
         cancel.clone(),
         done_tx.clone(),
+        bytes_up_ctr,
     ));
     let h_down = tokio::spawn(copy_dir(
         id,
@@ -198,6 +231,7 @@ async fn relay(
         last_activity.clone(),
         cancel.clone(),
         done_tx.clone(),
+        bytes_down_ctr,
     ));
     // Drop our extra sender so the channel closes once both directions end.
     drop(done_tx);
@@ -215,10 +249,16 @@ async fn relay(
     let bytes_up = h_up.await.unwrap_or(0);
     let bytes_down = h_down.await.unwrap_or(0);
 
+    metrics
+        .connections_closed
+        .with_label_values(&[&cfg.name, reason])
+        .inc();
+
     info!(proxy = %cfg.name, id, %peer, target = %cfg.target, bytes_up, bytes_down, reason, "connection closed");
 }
 
 /// Copy one direction until EOF, error, or cancellation. Returns bytes copied.
+#[allow(clippy::too_many_arguments)]
 async fn copy_dir<R, W>(
     id: u64,
     dir: Dir,
@@ -227,6 +267,7 @@ async fn copy_dir<R, W>(
     last_activity: Arc<AtomicU64>,
     cancel: CancellationToken,
     done: mpsc::Sender<(Dir, End)>,
+    bytes: prometheus::IntCounter,
 ) -> u64
 where
     R: AsyncRead + Unpin,
@@ -254,6 +295,7 @@ where
                         end = End::Err;
                         break;
                     }
+                    bytes.inc_by(n as u64);
                 }
                 Err(e) => {
                     debug!(id, dir = dir.label(), "read: {e}");
