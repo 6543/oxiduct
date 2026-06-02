@@ -61,6 +61,7 @@ pub struct ProxyConfig {
 /// typed/integer fields with the `toml` crate. Each proxy lists the knobs
 /// explicitly and converts into this struct via [`TomlProxy::tuning`].
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlTuning {
     connect_timeout: Option<u64>,
     keepalive_idle: Option<u64>,
@@ -130,6 +131,7 @@ struct ResolvedTuning {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlProxy {
     name: Option<String>,
     listen: String,
@@ -164,6 +166,7 @@ impl TomlProxy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlFile {
     #[serde(default)]
     defaults: TomlTuning,
@@ -395,6 +398,62 @@ mod tests {
         .unwrap();
         let loaded = load(f.path()).unwrap();
         assert_eq!(loaded.metrics_listen, None);
+    }
+
+    #[test]
+    fn unknown_top_level_field_rejected() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            bogus_field = "oops"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load(f.path()).unwrap_err());
+        assert!(err.contains("bogus_field"), "got: {err}");
+    }
+
+    #[test]
+    fn metrics_listen_inside_defaults_rejected() {
+        // Regression: metrics_listen accidentally placed inside [defaults]
+        // used to be silently ignored. Must now error.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            [defaults]
+            keepalive_idle = 60
+            metrics_listen = "127.0.0.1:9090"
+
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load(f.path()).unwrap_err());
+        assert!(err.contains("metrics_listen"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_proxy_field_rejected() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            typo_here = 42
+            "#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load(f.path()).unwrap_err());
+        assert!(err.contains("typo_here"), "got: {err}");
     }
 
     #[test]
