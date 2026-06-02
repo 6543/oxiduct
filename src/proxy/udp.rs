@@ -83,7 +83,7 @@ pub async fn serve(
                 let mut map = sessions2.lock().await;
                 map.retain(|src, s| {
                     let last = s.last_activity.load(Ordering::Relaxed);
-                    let stale = now.saturating_sub(last) >= idle_secs * 1000;
+                    let stale = now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
                     if stale {
                         debug!(%src, "UDP session idle timeout");
                         s.cancel.cancel();
@@ -129,52 +129,71 @@ pub async fn serve(
                 };
                 let data = recv_buf[..n].to_vec();
 
+                // Fast path: existing session. Short critical section only.
+                {
+                    let map = sessions.lock().await;
+                    if let Some(session) = map.get(&src) {
+                        session.last_activity.store(now_ms(), Ordering::Relaxed);
+                        // Non-blocking send: drop packet if relay task is behind
+                        if session.tx.try_send(data).is_err() {
+                            debug!(%src, "UDP relay channel full, packet dropped");
+                        }
+                        continue;
+                    }
+                }
+
+                // Slow path: first packet from this source. Admit, then build
+                // the session WITHOUT holding the sessions lock — open_session
+                // does DNS + bind + connect and could otherwise stall the whole
+                // listener (and every other session) for a hostile/slow target.
+                let slot = match limits.try_acquire(src.ip()) {
+                    Ok(g) => g,
+                    Err(Reject::Total) => {
+                        error!(
+                            proxy = %cfg.name,
+                            src_ip = %src.ip(),
+                            limit = limits.max_total,
+                            "UDP session rejected: total limit reached"
+                        );
+                        metrics.connections_rejected
+                            .with_label_values(&[&cfg.name, "total"]).inc();
+                        continue;
+                    }
+                    Err(Reject::PerIp) => {
+                        error!(
+                            proxy = %cfg.name,
+                            src_ip = %src.ip(),
+                            limit = limits.max_per_ip,
+                            "UDP session rejected: per-IP limit reached"
+                        );
+                        metrics.connections_rejected
+                            .with_label_values(&[&cfg.name, "per_ip"]).inc();
+                        continue;
+                    }
+                };
+
+                let session = match open_session(src, &cfg, &metrics, listen_sock.clone(), shutdown.clone(), slot).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(%src, "UDP session open failed: {e:#}");
+                        continue;
+                    }
+                };
+
+                // Re-acquire to insert. Another packet from the same source may
+                // have raced us to create a session while we were resolving; if
+                // so, keep the existing one and drop ours (its Guard releases).
                 let mut map = sessions.lock().await;
-
-                if let Some(session) = map.get(&src) {
-                    session.last_activity.store(now_ms(), Ordering::Relaxed);
-                    // Non-blocking send: drop packet if relay task is behind
-                    if session.tx.try_send(data).is_err() {
-                        debug!(%src, "UDP relay channel full, packet dropped");
-                    }
+                if let Some(existing) = map.get(&src) {
+                    existing.last_activity.store(now_ms(), Ordering::Relaxed);
+                    let _ = existing.tx.try_send(data);
+                    session.cancel.cancel(); // tear down the loser's relay tasks
                 } else {
-                    // First packet from this source: try to admit, then open a session.
-                    let slot = match limits.try_acquire(src.ip()) {
-                        Ok(g) => g,
-                        Err(Reject::Total) => {
-                            error!(
-                                proxy = %cfg.name,
-                                src_ip = %src.ip(),
-                                limit = limits.max_total,
-                                "UDP session rejected: total limit reached"
-                            );
-                            metrics.connections_rejected
-                                .with_label_values(&[&cfg.name, "total"]).inc();
-                            continue;
-                        }
-                        Err(Reject::PerIp) => {
-                            error!(
-                                proxy = %cfg.name,
-                                src_ip = %src.ip(),
-                                limit = limits.max_per_ip,
-                                "UDP session rejected: per-IP limit reached"
-                            );
-                            metrics.connections_rejected
-                                .with_label_values(&[&cfg.name, "per_ip"]).inc();
-                            continue;
-                        }
-                    };
-
-                    match open_session(src, &cfg, &metrics, listen_sock.clone(), shutdown.clone(), slot).await {
-                        Err(e) => warn!(%src, "UDP session open failed: {e:#}"),
-                        Ok(session) => {
-                            let _ = session.tx.try_send(data);
-                            map.insert(src, session);
-                            metrics.connections_total
-                                .with_label_values(&[&cfg.name, "udp"]).inc();
-                            active.set(map.len() as i64);
-                        }
-                    }
+                    let _ = session.tx.try_send(data);
+                    map.insert(src, session);
+                    metrics.connections_total
+                        .with_label_values(&[&cfg.name, "udp"]).inc();
+                    active.set(map.len() as i64);
                 }
             }
         }

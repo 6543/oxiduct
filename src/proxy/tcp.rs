@@ -335,12 +335,14 @@ async fn watchdog(
         let now = now_ms();
         let mut wake_ms = WATCHDOG_TICK.as_millis() as u64;
         if idle_secs > 0 {
-            let deadline = last_activity.load(Ordering::Relaxed) + idle_secs * 1000;
+            let deadline = last_activity
+                .load(Ordering::Relaxed)
+                .saturating_add(idle_secs.saturating_mul(1000));
             wake_ms = wake_ms.min(deadline.saturating_sub(now));
         }
         if half_close_secs > 0 {
             if let Some(since) = half_close_since {
-                let deadline = since + half_close_secs * 1000;
+                let deadline = since.saturating_add(half_close_secs.saturating_mul(1000));
                 wake_ms = wake_ms.min(deadline.saturating_sub(now));
             }
         }
@@ -377,7 +379,7 @@ async fn watchdog(
         // L3: application-level idle timeout.
         if idle_secs > 0 {
             let idle_ms = now.saturating_sub(last_activity.load(Ordering::Relaxed));
-            if idle_ms >= idle_secs * 1000 {
+            if idle_ms >= idle_secs.saturating_mul(1000) {
                 cancel.cancel();
                 return "idle_timeout";
             }
@@ -386,7 +388,7 @@ async fn watchdog(
         // L4: half-close grace period.
         if half_close_secs > 0 && (up_done || down_done) {
             let since = *half_close_since.get_or_insert(now);
-            if now.saturating_sub(since) >= half_close_secs * 1000 {
+            if now.saturating_sub(since) >= half_close_secs.saturating_mul(1000) {
                 cancel.cancel();
                 return "half_close_timeout";
             }
