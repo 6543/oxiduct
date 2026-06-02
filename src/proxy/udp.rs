@@ -116,7 +116,17 @@ pub async fn serve(
                 break;
             }
             result = listen_sock.recv_from(&mut recv_buf) => {
-                let (n, src) = result.context("UDP recv_from")?;
+                let (n, src) = match result {
+                    Ok(v) => v,
+                    // A recv error here is non-fatal: on Linux a prior send to a
+                    // closed target can surface as ECONNREFUSED (ICMP port
+                    // unreachable) on a later recv_from. Logging and continuing
+                    // prevents a remote peer from killing the whole listener.
+                    Err(e) => {
+                        warn!(proxy = %cfg.name, "UDP recv error: {e}");
+                        continue;
+                    }
+                };
                 let data = recv_buf[..n].to_vec();
 
                 let mut map = sessions.lock().await;

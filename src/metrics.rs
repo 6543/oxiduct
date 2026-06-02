@@ -9,13 +9,21 @@
 //! used as labels — that would let any client blow up series cardinality.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Max time a metrics client may take to send its request line + be served.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max simultaneous in-flight metrics requests (scrapers are few; this just
+/// bounds abuse).
+const MAX_INFLIGHT: usize = 16;
 
 /// All metric families, registered against one private registry.
 pub struct Metrics {
@@ -128,6 +136,8 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>, shutdown: CancellationTo
         .with_context(|| format!("metrics bind {addr}"))?;
     info!(%addr, "metrics exporter listening on /metrics");
 
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
+
     loop {
         tokio::select! {
             biased;
@@ -143,10 +153,23 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>, shutdown: CancellationTo
                         continue;
                     }
                 };
+                // Drop the connection immediately if we're already at the
+                // in-flight cap, rather than queueing unbounded work.
+                let permit = match inflight.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("metrics request dropped: too many concurrent requests");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_request(stream, &metrics).await {
-                        warn!("metrics request error: {e}");
+                    let _permit = permit;
+                    match tokio::time::timeout(REQUEST_TIMEOUT, handle_request(stream, &metrics)).await {
+                        Ok(Err(e)) => warn!("metrics request error: {e}"),
+                        Err(_) => warn!("metrics request timed out"),
+                        Ok(Ok(())) => {}
                     }
                 });
             }
