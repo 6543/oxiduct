@@ -1,207 +1,190 @@
 # oxiduct
 
-Pipe traffic through oxidized steel — a robust TCP/UDP proxy with dead-connection detection.
+[![CI](https://ci.woodpecker-ci.org/api/badges/8998/status.svg)](https://ci.woodpecker-ci.org/repos/8998)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/oxiduct.svg)](https://crates.io/crates/oxiduct)
 
-## Why not socat?
+> A TCP/UDP proxy that actually cleans up after itself.
 
-`socat` is great for quick jobs but has a known failure mode: when a client is killed
-ungracefully (`kill -9`, suspend, network drop) the proxy connection hangs open indefinitely.
-`oxiduct` layers multiple liveness mechanisms to prevent this:
+`socat` is great — until a client crashes hard and the connection hangs open forever. `oxiduct` fixes that. It proxies TCP and UDP traffic while automatically detecting and closing dead connections, so you never have to restart your proxy to clean up ghost sessions.
 
-| Layer | Mechanism | Default |
-|-------|-----------|---------|
-| L1 | `SO_KEEPALIVE` + `TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT` | 60s / 10s / 6 |
-| L2 | `TCP_USER_TIMEOUT` — kernel force-closes unacked connections (Linux) | 90 000 ms |
-| L3 | Application idle timeout — no bytes either direction → close | 300 s |
-| L4 | Half-close grace — one side EOFs → deadline on the other | 30 s |
+---
 
-## Usage
-
-### Single-proxy (replaces one socat invocation)
+## Install
 
 ```sh
-oxiduct --listen 0.0.0.0:587 --target mail.example.com:587
-# or just the port number:
+cargo install oxiduct
+```
+
+Or grab a binary from the [releases page](https://github.com/6543/oxiduct/releases).
+
+---
+
+## Quick start
+
+**Forward a port (TCP):**
+```sh
 oxiduct --listen 587 --target mail.example.com:587
 ```
 
-### Multi-proxy (config file)
-
-```sh
-oxiduct --config /etc/oxiduct/config.toml
-```
-
-See [`contrib/example.toml`](contrib/example.toml) for all options.
-
-### UDP
-
+**Forward UDP:**
 ```sh
 oxiduct --listen 5353 --target 1.1.1.1:53 --protocol udp
 ```
 
-## Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--connect-timeout` | 3 | Connect timeout (s) |
-| `--keepalive-idle` | 60 | TCP keepalive idle time (s) |
-| `--keepalive-interval` | 10 | TCP keepalive probe interval (s) |
-| `--keepalive-retries` | 6 | TCP keepalive max probes |
-| `--user-timeout-ms` | 90000 | `TCP_USER_TIMEOUT` (ms, Linux only) |
-| `--idle-timeout` | 300 | App idle timeout (s, 0=off) |
-| `--half-close-timeout` | 30 | Half-close grace (s, 0=off) |
-| `--max-connections` | 32000 | Max simultaneous connections per proxy (0=off) |
-| `--max-per-ip` | 320 | Max simultaneous connections per source IP (0=off) |
-| `--shutdown-grace` | 10 | SIGTERM grace period (s) |
-| `--metrics-listen` | (off) | Serve Prometheus metrics at GET /metrics on this address |
-| `--log-level` | info | Tracing level / `RUST_LOG` |
-
-## Demo / local testing
-
-You can verify oxiduct against a local echo server with just `socat` and `nc`.
-
-### TCP — echo through proxy
-
+**Multiple proxies via config file:**
 ```sh
-# Terminal 1 — start an echo server on port 19001
-socat TCP-LISTEN:19001,fork,reuseaddr EXEC:cat
-
-# Terminal 2 — run oxiduct in front of it on port 19002
-oxiduct --listen 127.0.0.1:19002 --target 127.0.0.1:19001 --log-level debug
-
-# Terminal 3 — talk to the proxy
-echo "hello via oxiduct" | nc -q1 127.0.0.1 19002
+oxiduct --config /etc/oxiduct/config.toml
 ```
 
-The proxy will log the connection, the byte counts, and the close reason.
+That's it. Logs go to stdout. Press Ctrl-C or send `SIGTERM` to shut down gracefully.
 
-### Verify the idle timeout fires
+---
 
-```sh
-# Start a proxy with a 4-second idle timeout
-oxiduct --listen 127.0.0.1:19002 --target 127.0.0.1:19001 --idle-timeout 4
+## Why not just use socat?
 
-# Open a connection that sends nothing (sleep keeps stdin open)
-sleep 60 | nc 127.0.0.1 19002 &
+`socat` works well for quick jobs, but has one painful failure mode: if a client dies hard (power loss, `kill -9`, network drop) the proxy connection stays open indefinitely — no error, no cleanup, just a ghost session eating a file descriptor.
 
-# Within ~10s (4s idle + 5s watchdog tick) the proxy will log:
-#   reason="idle_timeout"
-```
+`oxiduct` layers four liveness checks to catch these situations:
 
-### Verify the half-close timeout fires
+| Layer | What it does | Default |
+|-------|-------------|---------|
+| L1 | TCP keepalive probes at the kernel level | Every 10s, 6 retries |
+| L2 | Force-close unacknowledged connections (`TCP_USER_TIMEOUT`, Linux) | After 90s |
+| L3 | Close if no data flows in either direction | After 5 min |
+| L4 | If one side closes, give the other side a deadline | 30s grace |
 
-Use a server that sends data and then stops responding (without closing):
+Any one of these is usually enough. Together they cover virtually every dead-connection scenario.
 
-```sh
-# Server: send a greeting, then hold forever
-socat TCP-LISTEN:19001,fork,reuseaddr EXEC:'sh -c "echo hello; sleep 3600"'
+---
 
-# Proxy with a 3s half-close grace
-oxiduct --listen 127.0.0.1:19002 --target 127.0.0.1:19001 \
-        --idle-timeout 0 --half-close-timeout 3
+## Config file
 
-# Client: read the greeting, then close write side and watch the proxy
-# close the connection after ~3s (instead of hanging forever).
-exec 3<>/dev/tcp/127.0.0.1/19002
-read line <&3 ; echo "got: $line"
-exec 3>&-
-read line <&3   # blocks briefly, then EOF
-```
-
-### UDP echo
-
-```sh
-# Terminal 1 — UDP echo with Python (one-shot)
-python3 -c '
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("127.0.0.1", 19031))
-while True:
-    data, addr = s.recvfrom(65535)
-    s.sendto(data, addr)
-'
-
-# Terminal 2
-oxiduct --listen 127.0.0.1:19032 --target 127.0.0.1:19031 --protocol udp
-
-# Terminal 3
-echo "hello udp" | socat -T2 - UDP:127.0.0.1:19032
-```
-
-## Config-file example
-
-`config.toml`:
+For multiple proxies or persistent settings, use a TOML config:
 
 ```toml
-# Defaults apply to every [[proxy]] unless overridden per-entry.
+# Defaults apply to all proxies (you can override per-proxy)
 [defaults]
-connect_timeout    = 3       # seconds
-keepalive_idle     = 60      # seconds
-keepalive_interval = 10      # seconds
-keepalive_retries  = 6
-user_timeout_ms    = 90000   # Linux/Android; 0 = OS default
-idle_timeout       = 300     # seconds; 0 = disable
-half_close_timeout = 30      # seconds; 0 = disable
-max_connections    = 32000   # total cap; 0 = unlimited
-max_per_ip         = 320     # per-source-IP cap; 0 = unlimited
+idle_timeout       = 300   # close if silent for 5 min (seconds, 0 = off)
+half_close_timeout = 30    # grace period when one side closes (seconds)
+max_connections    = 32000 # total connection cap (0 = unlimited)
+max_per_ip         = 320   # per-source-IP cap (0 = unlimited)
 
 [[proxy]]
-name     = "smtp-submission"
+name     = "smtp"
 listen   = "0.0.0.0:587"
 target   = "mail.example.com:587"
 protocol = "tcp"
 
 [[proxy]]
-name     = "dns-relay"
-listen   = "5353"            # bare port → 0.0.0.0:5353
+name     = "dns"
+listen   = "5353"          # bare port expands to 0.0.0.0:5353
 target   = "1.1.1.1:53"
 protocol = "udp"
 
-# Per-proxy override: long-lived git over SSH needs a bigger idle window
+# Per-proxy override: SSH sessions can be idle for longer
 [[proxy]]
-name               = "git-ssh"
-listen             = "0.0.0.0:2222"
-target             = "github.com:22"
-protocol           = "tcp"
-idle_timeout       = 3600
-half_close_timeout = 60
+name         = "git-ssh"
+listen       = "0.0.0.0:2222"
+target       = "github.com:22"
+idle_timeout = 3600
 ```
 
-Run it:
+See [`contrib/example.toml`](contrib/example.toml) for all available options with comments.
 
-```sh
-oxiduct --config config.toml
-```
+---
 
-See [`contrib/example.toml`](contrib/example.toml) for the version that ships with the repo.
+## All options
 
-## Metrics
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--listen` | (required) | Address or port to listen on |
+| `--target` | (required) | Upstream host:port to forward to |
+| `--protocol` | `tcp` | `tcp` or `udp` |
+| `--config` | | Load from TOML config instead of flags |
+| `--connect-timeout` | 3s | How long to wait for upstream to connect |
+| `--idle-timeout` | 300s | Close connection if silent this long (0 = off) |
+| `--half-close-timeout` | 30s | Grace period after one side closes (0 = off) |
+| `--max-connections` | 32000 | Max simultaneous connections (0 = unlimited) |
+| `--max-per-ip` | 320 | Max connections per source IP (0 = unlimited) |
+| `--shutdown-grace` | 10s | Time to finish active connections on SIGTERM |
+| `--metrics-listen` | (off) | Expose Prometheus metrics at this address |
+| `--log-level` | `info` | Log verbosity (`trace`/`debug`/`info`/`warn`/`error`) |
+| `--keepalive-idle` | 60s | TCP keepalive idle time |
+| `--keepalive-interval` | 10s | TCP keepalive probe interval |
+| `--keepalive-retries` | 6 | TCP keepalive max probes |
+| `--user-timeout-ms` | 90000 | `TCP_USER_TIMEOUT` in ms (Linux only, 0 = OS default) |
 
-oxiduct can expose Prometheus metrics for monitoring, alerting and security
-auditing. Enable the exporter with `--metrics-listen` (CLI) or `metrics_listen`
-(TOML, top level):
+---
+
+## Metrics (Prometheus)
+
+Enable the metrics endpoint:
 
 ```sh
 oxiduct --listen 587 --target mail.example.com:587 --metrics-listen 127.0.0.1:9090
 curl http://127.0.0.1:9090/metrics
 ```
 
-Exposed series (all labelled by `proxy`):
+Or in the config file (top level):
+```toml
+metrics_listen = "127.0.0.1:9090"
+```
 
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `oxiduct_connections_total` | counter | proxy, protocol | Connections accepted / UDP sessions opened |
-| `oxiduct_connections_rejected_total` | counter | proxy, reason | Refused by the limiter (`total` / `per_ip`) |
-| `oxiduct_connect_failures_total` | counter | proxy | Upstream TCP connect failures |
-| `oxiduct_connect_timeouts_total` | counter | proxy | Upstream TCP connect timeouts |
-| `oxiduct_bytes_total` | counter | proxy, direction | Bytes relayed (`up` / `down`), updated live |
-| `oxiduct_connections_closed_total` | counter | proxy, reason | Closes by reason (`eof`/`reset`/`idle_timeout`/`half_close_timeout`/`shutdown`) |
-| `oxiduct_active_connections` | gauge | proxy | Currently active connections / sessions |
-| `oxiduct_max_connections` | gauge | proxy | Configured total cap (0 = unlimited) |
-| `oxiduct_max_per_ip` | gauge | proxy | Configured per-IP cap (0 = unlimited) |
+Available metrics (all labelled by `proxy`):
 
-Throughput is derived in Prometheus with `rate(oxiduct_bytes_total[1m])`.
-Source IPs are deliberately not used as labels to bound series cardinality.
+| Metric | What it counts |
+|--------|---------------|
+| `oxiduct_connections_total` | Connections accepted (or UDP sessions opened) |
+| `oxiduct_connections_rejected_total` | Connections refused by rate limits |
+| `oxiduct_connect_failures_total` | Failed upstream connect attempts |
+| `oxiduct_connect_timeouts_total` | Timed-out upstream connect attempts |
+| `oxiduct_bytes_total` | Bytes relayed, split by `up`/`down` direction |
+| `oxiduct_connections_closed_total` | Closed connections, split by reason |
+| `oxiduct_active_connections` | Currently open connections |
+| `oxiduct_max_connections` | Configured connection cap |
+| `oxiduct_max_per_ip` | Configured per-IP cap |
+
+Throughput in Prometheus: `rate(oxiduct_bytes_total[1m])`
+
+Close reasons: `eof` / `reset` / `idle_timeout` / `half_close_timeout` / `shutdown`
+
+---
+
+## Testing locally
+
+Verify the proxy works with just `nc` and `socat`:
+
+```sh
+# Terminal 1: start an echo server
+socat TCP-LISTEN:19001,fork,reuseaddr EXEC:cat
+
+# Terminal 2: start oxiduct in front of it
+oxiduct --listen 127.0.0.1:19002 --target 127.0.0.1:19001 --log-level debug
+
+# Terminal 3: send something through
+echo "hello via oxiduct" | nc -q1 127.0.0.1 19002
+```
+
+The proxy logs the connection, byte counts, and why it closed.
+
+---
+
+## Why does this exist?
+
+No existing tool did exactly this one job well.
+
+HAProxy is great — but it's a load balancer, not a simple port forwarder. `socat` works as a quick hack but the dead-connection problem makes it unsuitable for long-running services. Everything else either does too much or doesn't handle connection cleanup at all.
+
+`oxiduct` is not a passion project. It's a tool that was needed, so it was built. The focus is deliberately narrow:
+
+- just a proxy — small, does one thing well
+- metrics and rate limiting included (you're on the frontline)
+- secure by default, no surprises
+
+If you need a simple, reliable TCP/UDP forwarder you can run as a one-shot command or a system service and then forget about, this is it.
+
+---
 
 ## License
 
