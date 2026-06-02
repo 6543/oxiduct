@@ -49,6 +49,15 @@ impl Dir {
     }
 }
 
+/// How a direction's copy loop ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// Clean EOF (read returned 0).
+    Eof,
+    /// Read or write error — typically a reset connection.
+    Err,
+}
+
 // ── Accept loop ──────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: Arc<ProxyConfig>, shutdown: CancellationToken) -> Result<()> {
@@ -138,42 +147,29 @@ async fn handle(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            warn!(id, %peer, target = %cfg.target, "connect failed: {e}");
+            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
             return;
         }
         Err(_) => {
-            warn!(id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
+            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
             return;
         }
     };
 
     socket_opts::apply_tcp(&outbound, &cfg);
 
-    info!(id, %peer, target = %cfg.target, "connected");
-    relay(
-        id,
-        peer,
-        inbound,
-        outbound,
-        cfg.idle_timeout_secs,
-        cfg.half_close_timeout_secs,
-        &cfg.target,
-        shutdown,
-    )
-    .await;
+    info!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connected");
+    relay(id, peer, inbound, outbound, &cfg, shutdown).await;
 }
 
 // ── Bidirectional relay ──────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn relay(
     id: u64,
     peer: SocketAddr,
     inbound: TcpStream,
     outbound: TcpStream,
-    idle_secs: u64,
-    half_close_secs: u64,
-    target: &str,
+    cfg: &ProxyConfig,
     shutdown: CancellationToken,
 ) {
     let (ir, iw) = inbound.into_split();
@@ -183,7 +179,7 @@ async fn relay(
     // directions. Each direction reports completion once over `done_tx`.
     let last_activity = Arc::new(AtomicU64::new(now_ms()));
     let cancel = CancellationToken::new();
-    let (done_tx, done_rx) = mpsc::channel::<Dir>(2);
+    let (done_tx, done_rx) = mpsc::channel::<(Dir, End)>(2);
 
     let h_up = tokio::spawn(copy_dir(
         id,
@@ -211,15 +207,15 @@ async fn relay(
         last_activity,
         cancel,
         shutdown,
-        idle_secs,
-        half_close_secs,
+        cfg.idle_timeout_secs,
+        cfg.half_close_timeout_secs,
     )
     .await;
 
     let bytes_up = h_up.await.unwrap_or(0);
     let bytes_down = h_down.await.unwrap_or(0);
 
-    info!(id, %peer, %target, bytes_up, bytes_down, reason, "connection closed");
+    info!(proxy = %cfg.name, id, %peer, target = %cfg.target, bytes_up, bytes_down, reason, "connection closed");
 }
 
 /// Copy one direction until EOF, error, or cancellation. Returns bytes copied.
@@ -230,7 +226,7 @@ async fn copy_dir<R, W>(
     mut writer: W,
     last_activity: Arc<AtomicU64>,
     cancel: CancellationToken,
-    done: mpsc::Sender<Dir>,
+    done: mpsc::Sender<(Dir, End)>,
 ) -> u64
 where
     R: AsyncRead + Unpin,
@@ -238,6 +234,7 @@ where
 {
     let mut buf = vec![0u8; BUF_SIZE];
     let mut total: u64 = 0;
+    let mut end = End::Eof;
 
     loop {
         tokio::select! {
@@ -254,12 +251,14 @@ where
                     total += n as u64;
                     if let Err(e) = writer.write_all(&buf[..n]).await {
                         debug!(id, dir = dir.label(), "write: {e}");
+                        end = End::Err;
                         break;
                     }
                 }
                 Err(e) => {
                     debug!(id, dir = dir.label(), "read: {e}");
                     let _ = writer.shutdown().await;
+                    end = End::Err;
                     break;
                 }
             }
@@ -267,14 +266,14 @@ where
     }
 
     // Always report completion (ignored if the watchdog already returned).
-    let _ = done.send(dir).await;
+    let _ = done.send((dir, end)).await;
     total
 }
 
 /// Enforce L3 (idle) and L4 (half-close) and forward global shutdown.
 /// Returns the reason the connection ended, for logging.
 async fn watchdog(
-    mut done_rx: mpsc::Receiver<Dir>,
+    mut done_rx: mpsc::Receiver<(Dir, End)>,
     last_activity: Arc<AtomicU64>,
     cancel: CancellationToken,
     shutdown: CancellationToken,
@@ -283,10 +282,29 @@ async fn watchdog(
 ) -> &'static str {
     let mut up_done = false;
     let mut down_done = false;
+    let mut saw_error = false;
     let mut channel_open = true;
     let mut half_close_since: Option<u64> = None;
 
     loop {
+        // Sleep only as long as the nearest deadline needs, capped at
+        // WATCHDOG_TICK. This keeps small idle/half-close timeouts accurate
+        // instead of rounding up to a fixed tick.
+        let now = now_ms();
+        let mut wake_ms = WATCHDOG_TICK.as_millis() as u64;
+        if idle_secs > 0 {
+            let deadline = last_activity.load(Ordering::Relaxed) + idle_secs * 1000;
+            wake_ms = wake_ms.min(deadline.saturating_sub(now));
+        }
+        if half_close_secs > 0 {
+            if let Some(since) = half_close_since {
+                let deadline = since + half_close_secs * 1000;
+                wake_ms = wake_ms.min(deadline.saturating_sub(now));
+            }
+        }
+        // Floor to avoid a busy spin when a deadline is essentially now.
+        let wake = Duration::from_millis(wake_ms.max(20));
+
         tokio::select! {
             _ = shutdown.cancelled() => {
                 cancel.cancel();
@@ -294,16 +312,22 @@ async fn watchdog(
             }
             // Disabled once the channel closes, to avoid a busy loop.
             maybe = done_rx.recv(), if channel_open => match maybe {
-                Some(Dir::Up) => up_done = true,
-                Some(Dir::Down) => down_done = true,
+                Some((Dir::Up, end)) => {
+                    up_done = true;
+                    saw_error |= end == End::Err;
+                }
+                Some((Dir::Down, end)) => {
+                    down_done = true;
+                    saw_error |= end == End::Err;
+                }
                 None => channel_open = false,
             },
-            _ = sleep(WATCHDOG_TICK) => {}
+            _ = sleep(wake) => {}
         }
 
-        // Both directions finished naturally → clean close.
+        // Both directions finished → clean EOF, or reset if either errored.
         if up_done && down_done {
-            return "eof";
+            return if saw_error { "reset" } else { "eof" };
         }
 
         let now = now_ms();

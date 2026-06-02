@@ -9,6 +9,8 @@ keepalive_retries  = 6
 user_timeout_ms    = 90000  # milliseconds; Linux/Android only; 0 = OS default
 idle_timeout       = 300    # seconds; 0 = disable
 half_close_timeout = 30     # seconds; 0 = disable
+max_connections    = 32000  # total simultaneous cap per proxy; 0 = unlimited
+max_per_ip         = 320    # simultaneous cap per source IP; 0 = unlimited
 
 # TCP proxy example
 [[proxy]]

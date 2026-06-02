@@ -10,6 +10,11 @@ use crate::config::defaults;
 /// Multi-proxy mode:   supply --config path/to/config.toml
 #[derive(Parser, Debug)]
 #[command(name = "oxiduct", version, about)]
+#[command(group(
+    clap::ArgGroup::new("mode")
+        .required(true)
+        .args(["config", "listen"]),
+))]
 pub struct Args {
     /// TOML config file (multi-proxy mode; conflicts with --listen / --target)
     #[arg(short, long, conflicts_with_all = ["listen", "target", "protocol"])]

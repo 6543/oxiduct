@@ -32,6 +32,15 @@ async fn main() -> Result<()> {
     for cfg in proxies {
         let cfg = Arc::new(cfg);
         info!(proxy = %cfg.name, "starting");
+        tracing::debug!(
+            proxy = %cfg.name,
+            protocol = ?cfg.protocol,
+            idle_timeout_secs = cfg.idle_timeout_secs,
+            half_close_timeout_secs = cfg.half_close_timeout_secs,
+            max_connections = cfg.max_connections,
+            max_per_ip = cfg.max_per_ip,
+            "resolved config"
+        );
         let token = shutdown.clone();
         handles.push(tokio::spawn(proxy::run(cfg, token)));
     }
