@@ -37,6 +37,15 @@ async fn main() -> Result<()> {
     }
 
     tokio::select! {
+        // A proxy task that exits early means bind failed — abort immediately.
+        result = wait_any(&mut handles) => {
+            if let Err(e) = result {
+                tracing::error!("proxy failed: {e:#}");
+                std::process::exit(1);
+            }
+            // All proxies exited cleanly without a signal (shouldn't happen normally).
+            return Ok(());
+        }
         _ = signal::ctrl_c() => info!("received SIGINT"),
         _ = sigterm()        => info!("received SIGTERM"),
     }
@@ -45,15 +54,48 @@ async fn main() -> Result<()> {
     info!(?grace, "shutting down");
     shutdown.cancel();
 
+    let mut any_error = false;
     let _ = tokio::time::timeout(grace, async {
         for h in handles {
-            let _ = h.await;
+            match h.await {
+                Ok(Err(e)) => {
+                    tracing::error!("proxy error: {e:#}");
+                    any_error = true;
+                }
+                Err(e) => {
+                    tracing::error!("proxy task panicked: {e}");
+                    any_error = true;
+                }
+                Ok(Ok(())) => {}
+            }
         }
     })
     .await;
 
     info!("bye");
+    if any_error {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Wait for the first handle to finish. Returns its result (or the join error).
+async fn wait_any(handles: &mut [tokio::task::JoinHandle<Result<()>>]) -> Result<()> {
+    loop {
+        let mut all_done = true;
+        for h in handles.iter_mut() {
+            if h.is_finished() {
+                return h
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("task panicked: {e}")));
+            }
+            all_done = false;
+        }
+        if all_done {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[cfg(unix)]
