@@ -24,6 +24,8 @@ use crate::limits::{ConnLimits, Reject};
 use crate::metrics::Metrics;
 use crate::socket_opts;
 
+use super::proxy_protocol;
+
 /// Relay buffer size, per direction.
 const BUF_SIZE: usize = 16 * 1024;
 /// How often the watchdog re-checks the idle / half-close deadlines.
@@ -154,7 +156,7 @@ async fn handle(
 ) {
     socket_opts::apply_tcp(&inbound, &cfg);
 
-    let outbound = match tokio::time::timeout(
+    let mut outbound = match tokio::time::timeout(
         Duration::from_secs(cfg.connect_timeout_secs),
         TcpStream::connect(&cfg.target),
     )
@@ -180,6 +182,24 @@ async fn handle(
     };
 
     socket_opts::apply_tcp(&outbound, &cfg);
+
+    // If enabled, the PROXY protocol header MUST be the first bytes written
+    // upstream, before the relay forwards any client data. `dst` is the local
+    // address the client connected to on us; `local_addr()` realistically
+    // never fails on a connected socket, but fall back to `peer` so the header
+    // stays well-formed (matching address family) rather than being skipped.
+    if cfg.proxy_protocol {
+        let dst = inbound.local_addr().unwrap_or(peer);
+        let header = proxy_protocol::v2_header(peer, dst);
+        if let Err(e) = outbound.write_all(&header).await {
+            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "PROXY protocol header write failed: {e}");
+            metrics
+                .connect_failures
+                .with_label_values(&[cfg.name.as_str()])
+                .inc();
+            return;
+        }
+    }
 
     info!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connected");
 

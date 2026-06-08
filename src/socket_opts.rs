@@ -63,6 +63,7 @@ mod tests {
             half_close_timeout_secs: 0,
             max_connections: 0,
             max_per_ip: 0,
+            proxy_protocol: false,
         }
     }
 

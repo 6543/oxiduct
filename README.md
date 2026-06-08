@@ -88,6 +88,15 @@ name         = "git-ssh"
 listen       = "0.0.0.0:2222"
 target       = "github.com:22"
 idle_timeout = 3600
+
+# Preserve the real client IP for a PROXY-protocol-aware backend (e.g. a mail
+# server doing per-IP rate limiting / auto-banning). The backend must be told
+# to trust this proxy's address, otherwise it will reject the header.
+[[proxy]]
+name           = "smtp-pp"
+listen         = "0.0.0.0:25"
+target         = "mailserver.internal:25"
+proxy_protocol = true
 ```
 
 See [`contrib/example.toml`](contrib/example.toml) for all available options with comments.
@@ -109,6 +118,7 @@ See [`contrib/example.toml`](contrib/example.toml) for all available options wit
 | `--max-per-ip` | 320 | Max connections per source IP (0 = unlimited) |
 | `--shutdown-grace` | 10s | Time to finish active connections on SIGTERM |
 | `--metrics-listen` | (off) | Expose Prometheus metrics at this address |
+| `--proxy-protocol` | off | Prepend a PROXY protocol v2 header upstream so the target sees the real client (TCP only) |
 | `--log-level` | `info` | Log verbosity (`trace`/`debug`/`info`/`warn`/`error`) |
 | `--keepalive-idle` | 60s | TCP keepalive idle time |
 | `--keepalive-interval` | 10s | TCP keepalive probe interval |

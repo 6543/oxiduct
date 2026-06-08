@@ -68,6 +68,12 @@ pub struct Args {
     #[arg(long, default_value_t = defaults::MAX_PER_IP)]
     pub max_per_ip: u32,
 
+    /// Prepend a PROXY protocol v2 header to each upstream connection so the
+    /// target sees the real client address (TCP only; ignored for UDP). The
+    /// target must be configured to trust this proxy's address.
+    #[arg(long)]
+    pub proxy_protocol: bool,
+
     /// Grace period on SIGTERM/SIGINT before force-closing connections (seconds)
     #[arg(long, default_value_t = defaults::SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace: u64,

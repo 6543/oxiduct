@@ -50,6 +50,8 @@ pub struct ProxyConfig {
     pub half_close_timeout_secs: u64,
     pub max_connections: u32,
     pub max_per_ip: u32,
+    /// Emit a PROXY protocol v2 header to the target on connect (TCP only).
+    pub proxy_protocol: bool,
 }
 
 // ── TOML shapes ──────────────────────────────────────────────────────────────
@@ -72,6 +74,7 @@ struct TomlTuning {
     half_close_timeout: Option<u64>,
     max_connections: Option<u32>,
     max_per_ip: Option<u32>,
+    proxy_protocol: Option<bool>,
 }
 
 impl TomlTuning {
@@ -114,6 +117,7 @@ impl TomlTuning {
                 .max_per_ip
                 .or(base.max_per_ip)
                 .unwrap_or(defaults::MAX_PER_IP),
+            proxy_protocol: self.proxy_protocol.or(base.proxy_protocol).unwrap_or(false),
         }
     }
 }
@@ -128,6 +132,7 @@ struct ResolvedTuning {
     half_close_timeout_secs: u64,
     max_connections: u32,
     max_per_ip: u32,
+    proxy_protocol: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +152,7 @@ struct TomlProxy {
     half_close_timeout: Option<u64>,
     max_connections: Option<u32>,
     max_per_ip: Option<u32>,
+    proxy_protocol: Option<bool>,
 }
 
 impl TomlProxy {
@@ -161,6 +167,7 @@ impl TomlProxy {
             half_close_timeout: self.half_close_timeout,
             max_connections: self.max_connections,
             max_per_ip: self.max_per_ip,
+            proxy_protocol: self.proxy_protocol,
         }
     }
 }
@@ -212,6 +219,7 @@ impl ProxyConfig {
             half_close_timeout_secs: args.half_close_timeout,
             max_connections: args.max_connections,
             max_per_ip: args.max_per_ip,
+            proxy_protocol: args.proxy_protocol,
         })
     }
 
@@ -236,6 +244,7 @@ impl ProxyConfig {
             half_close_timeout_secs: t.half_close_timeout_secs,
             max_connections: t.max_connections,
             max_per_ip: t.max_per_ip,
+            proxy_protocol: t.proxy_protocol,
         }
     }
 }
@@ -295,6 +304,7 @@ mod tests {
             shutdown_grace: defaults::SHUTDOWN_GRACE_SECS,
             metrics_listen: None,
             log_level: "info".into(),
+            proxy_protocol: false,
         }
     }
 
@@ -542,6 +552,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfgs[0].connect_timeout_secs, 99);
+    }
+
+    #[test]
+    fn proxy_protocol_defaults_false() {
+        let cfgs = load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        assert!(!cfgs[0].proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_per_proxy_true() {
+        let cfgs = load_str(
+            r#"
+            [[proxy]]
+            listen         = "127.0.0.1:1"
+            target         = "a:1"
+            proxy_protocol = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfgs[0].proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_from_defaults_section() {
+        let cfgs = load_str(
+            r#"
+            [defaults]
+            proxy_protocol = true
+
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        assert!(cfgs[0].proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_per_proxy_false_beats_defaults_true() {
+        let cfgs = load_str(
+            r#"
+            [defaults]
+            proxy_protocol = true
+
+            [[proxy]]
+            listen         = "127.0.0.1:1"
+            target         = "a:1"
+            proxy_protocol = false
+            "#,
+        )
+        .unwrap();
+        assert!(!cfgs[0].proxy_protocol);
     }
 
     #[test]

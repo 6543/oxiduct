@@ -15,6 +15,7 @@ idle_timeout       = 300    # seconds; 0 = disable
 half_close_timeout = 30     # seconds; 0 = disable
 max_connections    = 32000  # total simultaneous cap per proxy; 0 = unlimited
 max_per_ip         = 320    # simultaneous cap per source IP; 0 = unlimited
+proxy_protocol     = false  # prepend a PROXY protocol v2 header upstream (TCP only)
 
 # TCP proxy example
 [[proxy]]
@@ -38,3 +39,15 @@ target             = "github.com:22"
 protocol           = "tcp"
 idle_timeout       = 3600          # 1h — long-lived git operations
 half_close_timeout = 60
+
+# PROXY protocol example: forward port 25 to an internal mail server while
+# preserving the real client IP. The mail server must trust this proxy's
+# address (e.g. Stalwart: server.proxy.trusted-networks), or it will reject
+# the header. TCP only; the flag is ignored for UDP proxies.
+[[proxy]]
+name           = "smtp-inbound"
+listen         = "0.0.0.0:25"
+target         = "mailserver.internal:25"
+protocol       = "tcp"
+proxy_protocol = true
+
