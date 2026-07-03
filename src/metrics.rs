@@ -226,6 +226,23 @@ async fn handle_request(mut stream: tokio::net::TcpStream, metrics: &Metrics) ->
         stream.write_all(body).await?;
     }
     stream.flush().await?;
+
+    // Close gracefully: signal EOF, then briefly drain whatever the client
+    // still has in flight (the rest of its request headers). Dropping the
+    // socket with unread data pending makes the kernel send an RST, which can
+    // discard the response we just wrote. The drain is time-bounded so a
+    // client that simply keeps the connection open can't pin this handler
+    // (and its in-flight permit) until REQUEST_TIMEOUT.
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Ok(n) = stream.read(&mut sink).await {
+            if n == 0 {
+                break;
+            }
+        }
+    })
+    .await;
     Ok(())
 }
 
