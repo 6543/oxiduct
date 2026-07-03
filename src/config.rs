@@ -105,13 +105,15 @@ macro_rules! tuning_knobs {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--target required in single-proxy mode"))?;
 
-                Ok(Self {
+                let cfg = Self {
                     name: format!("{listen} -> {target}"),
                     listen,
                     target,
                     protocol: args.protocol,
                     $( $cfg: args.$toml, )+
-                })
+                };
+                cfg.validate()?;
+                Ok(cfg)
             }
 
             /// Resolve one TOML entry: per-proxy value → `[defaults]` → const.
@@ -146,6 +148,42 @@ tuning_knobs! {
     proxy_protocol     => proxy_protocol:          bool = false,
 }
 
+impl ProxyConfig {
+    /// Reject configurations that cannot work, with an error naming the
+    /// proxy, instead of failing later at bind time or per-connection.
+    pub fn validate(&self) -> Result<()> {
+        check_host_port(&self.listen)
+            .with_context(|| format!("proxy \"{}\": invalid listen address", self.name))?;
+        let target_port = check_host_port(&self.target)
+            .with_context(|| format!("proxy \"{}\": invalid target address", self.name))?;
+        if target_port == 0 {
+            anyhow::bail!("proxy \"{}\": target port must not be 0", self.name);
+        }
+        // 0 would mean "time out instantly", never "disabled" — every
+        // connection would fail. Catch the footgun at startup.
+        if self.connect_timeout_secs == 0 {
+            anyhow::bail!(
+                "proxy \"{}\": connect_timeout must be at least 1 second",
+                self.name
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Require `host:port` shape with a non-empty host and a valid port.
+/// Returns the port so callers can add their own constraints.
+fn check_host_port(s: &str) -> Result<u16> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("\"{s}\" is missing a :port"))?;
+    if host.is_empty() {
+        anyhow::bail!("\"{s}\" is missing a host");
+    }
+    port.parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("\"{s}\" has an invalid port \"{port}\""))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TomlFile {
@@ -176,12 +214,27 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
     }
 
     let metrics_listen = file.metrics_listen.clone();
-    let proxies = file
+    let proxies: Vec<ProxyConfig> = file
         .proxies
         .into_iter()
         .enumerate()
         .map(|(i, p)| ProxyConfig::from_toml(i, p, file.defaults))
         .collect();
+
+    // Per-proxy sanity, then cross-proxy uniqueness: duplicate names would
+    // silently merge metrics series and make logs ambiguous; duplicate listen
+    // addresses would only fail later at bind time with a worse message.
+    let mut names = std::collections::HashSet::new();
+    let mut listens = std::collections::HashSet::new();
+    for p in &proxies {
+        p.validate()?;
+        if !names.insert(p.name.as_str()) {
+            anyhow::bail!("duplicate proxy name \"{}\"", p.name);
+        }
+        if !listens.insert(p.listen.as_str()) {
+            anyhow::bail!("duplicate listen address \"{}\"", p.listen);
+        }
+    }
 
     Ok(LoadedConfig {
         proxies,
@@ -572,6 +625,129 @@ mod tests {
         .unwrap();
         assert!(cfgs[0].name.contains("127.0.0.1:1"));
         assert!(cfgs[0].name.contains("a:1"));
+    }
+
+    // ── Validation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_zero_connect_timeout() {
+        let err = load_str(
+            r#"
+            [[proxy]]
+            listen          = "127.0.0.1:1"
+            target          = "a:1"
+            connect_timeout = 0
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("connect_timeout"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_target_without_port() {
+        assert!(load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "example.com"
+            "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_target_port_zero() {
+        assert!(load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "example.com:0"
+            "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_listen() {
+        // Neither a bare port nor host:port.
+        assert!(load_str(
+            r#"
+            [[proxy]]
+            listen = "foobar"
+            target = "a:1"
+            "#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_allows_listen_port_zero() {
+        // Port 0 on listen = "pick a free port"; useful and legal.
+        assert!(load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:0"
+            target = "a:1"
+            "#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        let err = load_str(
+            r#"
+            [[proxy]]
+            name   = "same"
+            listen = "127.0.0.1:1"
+            target = "a:1"
+
+            [[proxy]]
+            name   = "same"
+            listen = "127.0.0.1:2"
+            target = "b:2"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate proxy name"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_listen() {
+        let err = load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:9"
+            target = "a:1"
+
+            [[proxy]]
+            listen = "127.0.0.1:9"
+            target = "b:2"
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate listen address"));
+    }
+
+    #[test]
+    fn from_cli_zero_connect_timeout_errors() {
+        let mut args = args_with(Some("1"), Some("a:1"), Protocol::Tcp);
+        args.connect_timeout = 0;
+        assert!(ProxyConfig::from_cli(&args).is_err());
+    }
+
+    #[test]
+    fn check_host_port_shapes() {
+        assert!(check_host_port("example.com:25").is_ok());
+        assert!(check_host_port("127.0.0.1:8080").is_ok());
+        assert!(check_host_port("[::1]:80").is_ok());
+        assert!(check_host_port("no-port").is_err());
+        assert!(check_host_port(":80").is_err());
+        assert!(check_host_port("host:").is_err());
+        assert!(check_host_port("host:99999").is_err());
     }
 
     #[test]
