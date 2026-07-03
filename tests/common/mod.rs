@@ -212,7 +212,7 @@ pub async fn spawn_udp_proxy_with_metrics(
 
 // ── Misc ────────────────────────────────────────────────────────────────────
 
-/// Sleep that's slightly shorter than the named duration. Used to "wait
+/// Sleep slightly *longer* (+500 ms) than the named duration, to "wait
 /// past" a timeout without being right on the boundary.
 pub async fn wait_past(secs: u64) {
     tokio::time::sleep(Duration::from_millis(secs * 1000 + 500)).await;

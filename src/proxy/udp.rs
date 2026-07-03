@@ -93,8 +93,8 @@ pub async fn serve(
                         return false;
                     }
                     let last = s.last_activity.load(Ordering::Relaxed);
-                    let stale = idle_secs > 0
-                        && now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
+                    let stale =
+                        idle_secs > 0 && now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
                     if stale {
                         debug!(%src, "UDP session idle timeout");
                         s.cancel.cancel();
