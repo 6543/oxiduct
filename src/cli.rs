@@ -29,8 +29,8 @@ pub struct Args {
     pub target: Option<String>,
 
     /// Protocol to proxy
-    #[arg(long, default_value = "tcp", value_parser = ["tcp", "udp"])]
-    pub protocol: String,
+    #[arg(long, value_enum, default_value = "tcp")]
+    pub protocol: crate::config::Protocol,
 
     /// Connect timeout (seconds)
     #[arg(long, default_value_t = defaults::CONNECT_TIMEOUT_SECS)]

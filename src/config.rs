@@ -26,7 +26,7 @@ pub mod defaults {
     pub const MAX_PER_IP: u32 = 320;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -109,7 +109,7 @@ macro_rules! tuning_knobs {
                     name: format!("{listen} -> {target}"),
                     listen,
                     target,
-                    protocol: parse_protocol(&args.protocol)?,
+                    protocol: args.protocol,
                     $( $cfg: args.$toml, )+
                 })
             }
@@ -189,24 +189,16 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
     })
 }
 
-fn parse_protocol(s: &str) -> Result<Protocol> {
-    match s {
-        "tcp" => Ok(Protocol::Tcp),
-        "udp" => Ok(Protocol::Udp),
-        other => anyhow::bail!("unknown protocol '{other}'; expected tcp or udp"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn args_with(listen: Option<&str>, target: Option<&str>, protocol: &str) -> Args {
+    fn args_with(listen: Option<&str>, target: Option<&str>, protocol: Protocol) -> Args {
         Args {
             config: None,
             listen: listen.map(String::from),
             target: target.map(String::from),
-            protocol: protocol.into(),
+            protocol,
             connect_timeout: defaults::CONNECT_TIMEOUT_SECS,
             keepalive_idle: defaults::KEEPALIVE_IDLE_SECS,
             keepalive_interval: defaults::KEEPALIVE_INTERVAL_SECS,
@@ -223,30 +215,11 @@ mod tests {
         }
     }
 
-    // ── parse_protocol ─────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_protocol_tcp() {
-        assert_eq!(parse_protocol("tcp").unwrap(), Protocol::Tcp);
-    }
-
-    #[test]
-    fn parse_protocol_udp() {
-        assert_eq!(parse_protocol("udp").unwrap(), Protocol::Udp);
-    }
-
-    #[test]
-    fn parse_protocol_unknown_errors() {
-        assert!(parse_protocol("quic").is_err());
-        assert!(parse_protocol("").is_err());
-        assert!(parse_protocol("TCP").is_err()); // case-sensitive on purpose
-    }
-
     // ── ProxyConfig::from_cli ──────────────────────────────────────────────
 
     #[test]
     fn from_cli_full() {
-        let args = args_with(Some("587"), Some("mail.example.com:587"), "tcp");
+        let args = args_with(Some("587"), Some("mail.example.com:587"), Protocol::Tcp);
         let cfg = ProxyConfig::from_cli(&args).unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:587");
         assert_eq!(cfg.target, "mail.example.com:587");
@@ -260,26 +233,20 @@ mod tests {
 
     #[test]
     fn from_cli_udp() {
-        let args = args_with(Some("5353"), Some("1.1.1.1:53"), "udp");
+        let args = args_with(Some("5353"), Some("1.1.1.1:53"), Protocol::Udp);
         let cfg = ProxyConfig::from_cli(&args).unwrap();
         assert_eq!(cfg.protocol, Protocol::Udp);
     }
 
     #[test]
     fn from_cli_missing_listen_errors() {
-        let args = args_with(None, Some("a:1"), "tcp");
+        let args = args_with(None, Some("a:1"), Protocol::Tcp);
         assert!(ProxyConfig::from_cli(&args).is_err());
     }
 
     #[test]
     fn from_cli_missing_target_errors() {
-        let args = args_with(Some("1"), None, "tcp");
-        assert!(ProxyConfig::from_cli(&args).is_err());
-    }
-
-    #[test]
-    fn from_cli_bad_protocol_errors() {
-        let args = args_with(Some("1"), Some("a:1"), "icmp");
+        let args = args_with(Some("1"), None, Protocol::Tcp);
         assert!(ProxyConfig::from_cli(&args).is_err());
     }
 
