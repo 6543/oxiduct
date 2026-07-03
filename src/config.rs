@@ -584,4 +584,14 @@ mod tests {
         let path = std::path::Path::new("/nonexistent/oxiduct/test/file.toml");
         assert!(load(path).is_err());
     }
+
+    /// Guard against contrib/example.toml drifting from the real schema.
+    #[test]
+    fn contrib_example_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("contrib/example.toml");
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.proxies.len(), 4);
+        assert_eq!(loaded.metrics_listen.as_deref(), Some("127.0.0.1:9090"));
+        assert!(loaded.proxies.iter().any(|p| p.proxy_protocol));
+    }
 }
