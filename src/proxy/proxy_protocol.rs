@@ -12,7 +12,7 @@
 //!
 //! [PROXY protocol]: https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 /// The 12-byte v2 signature: `\r\n\r\n\0\r\nQUIT\n`.
 const SIGNATURE: [u8; 12] = [
@@ -30,27 +30,11 @@ const TP_TCP6: u8 = 0x21;
 /// Address family `AF_UNSPEC`, transport `UNSPEC`.
 const TP_UNSPEC: u8 = 0x00;
 
-/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form so
-/// `src` and `dst` share an address family.
-///
-/// MSRV (1.71) predates `IpAddr::to_canonical` (stable 1.75), so do it by hand.
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => {
-            let o = v6.octets();
-            let is_v4_mapped = o[..10].iter().all(|&b| b == 0) && o[10] == 0xff && o[11] == 0xff;
-            if is_v4_mapped {
-                IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-            } else {
-                IpAddr::V6(v6)
-            }
-        }
-        v4 => v4,
-    }
-}
-
 /// Build a PROXY protocol v2 header announcing `src` (the real downstream
 /// client) and `dst` (the local address that client connected to on us).
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are collapsed to IPv4 so
+/// `src` and `dst` share an address family where possible.
 ///
 /// On the rare address-family mismatch between `src` and `dst` (after
 /// canonicalising IPv4-mapped IPv6), a `LOCAL` command with an empty address
@@ -60,7 +44,7 @@ pub fn v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     let mut buf = Vec::with_capacity(28); // exact for the IPv4 case
     buf.extend_from_slice(&SIGNATURE);
 
-    match (canonical(src.ip()), canonical(dst.ip())) {
+    match (src.ip().to_canonical(), dst.ip().to_canonical()) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             buf.push(VER_CMD_PROXY);
             buf.push(TP_TCP4);
@@ -92,7 +76,7 @@ pub fn v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port))
