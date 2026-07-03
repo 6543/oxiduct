@@ -141,6 +141,10 @@ Or in the config file (top level):
 metrics_listen = "127.0.0.1:9090"
 ```
 
+The shutdown grace period can likewise be set at the top level of the config
+file (`shutdown_grace = 10`); the `--shutdown-grace` flag wins when both are
+given.
+
 Available metrics (all labelled by `proxy`):
 
 | Metric | What it counts |

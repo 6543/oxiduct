@@ -74,9 +74,11 @@ pub struct Args {
     #[arg(long)]
     pub proxy_protocol: bool,
 
-    /// Grace period on SIGTERM/SIGINT before force-closing connections (seconds)
-    #[arg(long, default_value_t = defaults::SHUTDOWN_GRACE_SECS)]
-    pub shutdown_grace: u64,
+    /// Grace period on SIGTERM/SIGINT before force-closing connections
+    /// (seconds). Also settable as a top-level `shutdown_grace` key in the
+    /// TOML config; this flag wins when both are given. [default: 10]
+    #[arg(long)]
+    pub shutdown_grace: Option<u64>,
 
     /// Serve Prometheus metrics at GET /metrics on this address (e.g. 127.0.0.1:9090).
     /// Unset = exporter disabled.

@@ -191,6 +191,8 @@ struct TomlFile {
     defaults: TomlTuning,
     /// Optional global Prometheus exporter address.
     metrics_listen: Option<String>,
+    /// Optional grace period on SIGTERM/SIGINT (seconds).
+    shutdown_grace: Option<u64>,
     #[serde(rename = "proxy")]
     proxies: Vec<TomlProxy>,
 }
@@ -200,6 +202,7 @@ struct TomlFile {
 pub struct LoadedConfig {
     pub proxies: Vec<ProxyConfig>,
     pub metrics_listen: Option<String>,
+    pub shutdown_grace: Option<u64>,
 }
 
 /// Load and resolve every `[[proxy]]` entry from a TOML config file.
@@ -214,6 +217,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
     }
 
     let metrics_listen = file.metrics_listen.clone();
+    let shutdown_grace = file.shutdown_grace;
     let proxies: Vec<ProxyConfig> = file
         .proxies
         .into_iter()
@@ -239,6 +243,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
     Ok(LoadedConfig {
         proxies,
         metrics_listen,
+        shutdown_grace,
     })
 }
 
@@ -261,7 +266,7 @@ mod tests {
             half_close_timeout: defaults::HALF_CLOSE_TIMEOUT_SECS,
             max_connections: defaults::MAX_CONNECTIONS,
             max_per_ip: defaults::MAX_PER_IP,
-            shutdown_grace: defaults::SHUTDOWN_GRACE_SECS,
+            shutdown_grace: None,
             metrics_listen: None,
             log_level: "info".into(),
             proxy_protocol: false,
@@ -628,6 +633,39 @@ mod tests {
     }
 
     // ── Validation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_shutdown_grace_top_level() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            shutdown_grace = 42
+
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        let loaded = load(f.path()).unwrap();
+        assert_eq!(loaded.shutdown_grace, Some(42));
+    }
+
+    #[test]
+    fn load_shutdown_grace_absent_is_none() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            f.path(),
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(load(f.path()).unwrap().shutdown_grace, None);
+    }
 
     #[test]
     fn validate_rejects_zero_connect_timeout() {

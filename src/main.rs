@@ -21,18 +21,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Resolve proxies + the global metrics address. CLI --metrics-listen wins
-    // over the TOML metrics_listen key.
-    let (proxies, metrics_listen) = if let Some(ref path) = args.config {
+    // Resolve proxies + global settings. CLI flags win over the TOML keys
+    // (metrics_listen, shutdown_grace); built-in defaults fill the rest.
+    let (proxies, metrics_listen, shutdown_grace) = if let Some(ref path) = args.config {
         let loaded = config::load(path)?;
         let addr = args.metrics_listen.clone().or(loaded.metrics_listen);
-        (loaded.proxies, addr)
+        let grace = args.shutdown_grace.or(loaded.shutdown_grace);
+        (loaded.proxies, addr, grace)
     } else {
         (
             vec![config::ProxyConfig::from_cli(&args)?],
             args.metrics_listen.clone(),
+            args.shutdown_grace,
         )
     };
+    let shutdown_grace = shutdown_grace.unwrap_or(config::defaults::SHUTDOWN_GRACE_SECS);
 
     let shutdown = CancellationToken::new();
     let stats = metrics::Metrics::new();
@@ -80,7 +83,7 @@ async fn main() -> Result<()> {
         _ = sigterm()        => info!("received SIGTERM"),
     }
 
-    let grace = Duration::from_secs(args.shutdown_grace);
+    let grace = Duration::from_secs(shutdown_grace);
     info!(?grace, "shutting down");
     shutdown.cancel();
 
