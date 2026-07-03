@@ -106,3 +106,59 @@ async fn ipv6_loopback_target() {
 
     proxy.stop().await;
 }
+
+/// Regression: a session whose relay task dies (e.g. ICMP port unreachable
+/// surfacing as ECONNREFUSED on the connected upstream socket) must not
+/// linger as a zombie. Its limits slot must be released and the next packet
+/// from the same source must transparently get a fresh session, even with
+/// idle_timeout disabled and max_connections = 1.
+#[tokio::test]
+async fn dead_session_evicted_and_recreated() {
+    // Target: a UDP port that is bound, then dropped -> nothing listens.
+    // On Linux, sends to it trigger ICMP unreachable and the connected
+    // upstream socket errors out, killing the session's relay tasks.
+    let dead = {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = s.local_addr().unwrap();
+        drop(s);
+        addr
+    };
+
+    let mut cfg = cfg_udp(dead);
+    cfg.name = "test".into();
+    cfg.max_connections = 1; // any slot leak would reject the next session
+    cfg.idle_timeout_secs = 0; // no idle eviction to hide the leak
+
+    let metrics = oxiduct::metrics::Metrics::new();
+    let proxy = spawn_udp_proxy_with_metrics(cfg, metrics.clone()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(proxy.addr).await.unwrap();
+
+    // Each send may hit a live-but-doomed or an already-dead session; either
+    // way no send may ever be rejected by the limiter.
+    for _ in 0..5 {
+        client.send(b"ping").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let rejected: u64 = ["total", "per_ip"]
+        .iter()
+        .map(|r| {
+            metrics
+                .connections_rejected
+                .with_label_values(&["test", r])
+                .get()
+        })
+        .sum();
+    assert_eq!(rejected, 0, "dead session leaked its limits slot");
+
+    // At least one re-created session proves eviction happened.
+    let opened = metrics
+        .connections_total
+        .with_label_values(&["test", "udp"])
+        .get();
+    assert!(opened >= 2, "expected session re-creation, got {opened}");
+
+    proxy.stop().await;
+}

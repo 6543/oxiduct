@@ -64,14 +64,19 @@ pub async fn serve(
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
     let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
 
-    // Cleanup task: evict idle sessions on a 5-second tick
-    if cfg.idle_timeout_secs > 0 {
+    // Cleanup task: on a 5-second tick, evict sessions that died (relay task
+    // hit an error and cancelled itself) and, if enabled, idle sessions.
+    // Without this, a dead session would pin its limits slot forever.
+    {
         let sessions2 = sessions.clone();
         let idle_secs = cfg.idle_timeout_secs;
         let shut = shutdown.clone();
-        let closed = metrics
+        let closed_idle = metrics
             .connections_closed
             .with_label_values(&[cfg.name.as_str(), "idle_timeout"]);
+        let closed_error = metrics
+            .connections_closed
+            .with_label_values(&[cfg.name.as_str(), "error"]);
         let active2 = active.clone();
         tokio::spawn(async move {
             loop {
@@ -82,12 +87,18 @@ pub async fn serve(
                 let now = now_ms();
                 let mut map = sessions2.lock().await;
                 map.retain(|src, s| {
+                    if s.cancel.is_cancelled() {
+                        debug!(%src, "UDP session dead, evicting");
+                        closed_error.inc();
+                        return false;
+                    }
                     let last = s.last_activity.load(Ordering::Relaxed);
-                    let stale = now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
+                    let stale = idle_secs > 0
+                        && now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
                     if stale {
                         debug!(%src, "UDP session idle timeout");
                         s.cancel.cancel();
-                        closed.inc();
+                        closed_idle.inc();
                     }
                     !stale
                 });
@@ -130,15 +141,29 @@ pub async fn serve(
                 let data = recv_buf[..n].to_vec();
 
                 // Fast path: existing session. Short critical section only.
+                // A dead session (relay task errored and cancelled itself) is
+                // evicted right here so this packet re-creates it below,
+                // instead of being dropped until the cleanup tick fires.
                 {
-                    let map = sessions.lock().await;
-                    if let Some(session) = map.get(&src) {
-                        session.last_activity.store(now_ms(), Ordering::Relaxed);
-                        // Non-blocking send: drop packet if relay task is behind
-                        if session.tx.try_send(data).is_err() {
-                            debug!(%src, "UDP relay channel full, packet dropped");
+                    let mut map = sessions.lock().await;
+                    match map.get(&src) {
+                        Some(session) if session.cancel.is_cancelled() => {
+                            debug!(%src, "UDP session dead, re-creating");
+                            map.remove(&src);
+                            metrics.connections_closed
+                                .with_label_values(&[cfg.name.as_str(), "error"]).inc();
+                            active.set(map.len() as i64);
+                            // fall through to the slow path
                         }
-                        continue;
+                        Some(session) => {
+                            session.last_activity.store(now_ms(), Ordering::Relaxed);
+                            // Non-blocking send: drop packet if relay task is behind
+                            if session.tx.try_send(data).is_err() {
+                                debug!(%src, "UDP relay channel full, packet dropped");
+                            }
+                            continue;
+                        }
+                        None => {}
                     }
                 }
 
@@ -182,15 +207,20 @@ pub async fn serve(
 
                 // Re-acquire to insert. Another packet from the same source may
                 // have raced us to create a session while we were resolving; if
-                // so, keep the existing one and drop ours (its Guard releases).
+                // so, keep the existing one (unless it already died) and drop
+                // ours (its Guard releases).
                 let mut map = sessions.lock().await;
-                if let Some(existing) = map.get(&src) {
+                if let Some(existing) = map.get(&src).filter(|s| !s.cancel.is_cancelled()) {
                     existing.last_activity.store(now_ms(), Ordering::Relaxed);
                     let _ = existing.tx.try_send(data);
                     session.cancel.cancel(); // tear down the loser's relay tasks
                 } else {
                     let _ = session.tx.try_send(data);
-                    map.insert(src, session);
+                    if map.insert(src, session).is_some() {
+                        // Replaced a session that died while we were resolving.
+                        metrics.connections_closed
+                            .with_label_values(&[cfg.name.as_str(), "error"]).inc();
+                    }
                     metrics.connections_total
                         .with_label_values(&[cfg.name.as_str(), "udp"]).inc();
                     active.set(map.len() as i64);
@@ -279,6 +309,9 @@ async fn open_session(
                     }
                 }
             }
+            // Mark the whole session dead so the partner task stops and the
+            // listener evicts (and can transparently re-create) the session.
+            c.cancel();
             debug!(%src, "UDP client→upstream task ended");
         });
     }
@@ -314,6 +347,7 @@ async fn open_session(
                     }
                 }
             }
+            c.cancel();
             debug!(%src, "UDP upstream→client task ended");
         });
     }

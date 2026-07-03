@@ -184,13 +184,22 @@ pub async fn spawn_tcp_proxy(cfg: ProxyConfig) -> ProxyHandle {
 }
 
 pub async fn spawn_udp_proxy(cfg: ProxyConfig) -> ProxyHandle {
+    spawn_udp_proxy_with_metrics(cfg, oxiduct::metrics::Metrics::new()).await
+}
+
+/// Like [`spawn_udp_proxy`] but with a caller-owned metrics registry, so
+/// tests can assert on counters.
+pub async fn spawn_udp_proxy_with_metrics(
+    cfg: ProxyConfig,
+    metrics: Arc<oxiduct::metrics::Metrics>,
+) -> ProxyHandle {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = socket.local_addr().unwrap();
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(oxiduct::proxy::udp::serve(
         socket,
         Arc::new(cfg),
-        oxiduct::metrics::Metrics::new(),
+        metrics,
         shutdown.clone(),
     ));
     tokio::task::yield_now().await;
