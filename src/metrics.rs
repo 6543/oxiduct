@@ -178,9 +178,18 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>, shutdown: CancellationTo
 }
 
 async fn handle_request(mut stream: tokio::net::TcpStream, metrics: &Metrics) -> Result<()> {
-    // Read just enough to see the request line. Scrapers send a tiny GET.
+    // Read until the request line is complete (first newline). A single
+    // read() can legally return a partial line; scrapers send tiny GETs, so
+    // 1 KiB is plenty and anything longer is cut off at the buffer.
     let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
+    let mut n = 0;
+    loop {
+        let read = stream.read(&mut buf[n..]).await?;
+        n += read;
+        if read == 0 || buf[..n].contains(&b'\n') || n == buf.len() {
+            break;
+        }
+    }
     let head = String::from_utf8_lossy(&buf[..n]);
     let first_line = head.lines().next().unwrap_or("");
 
@@ -237,6 +246,33 @@ mod tests {
         // HELP/TYPE lines present (valid exposition format).
         assert!(out.contains("# HELP oxiduct_bytes_total"));
         assert!(out.contains("# TYPE oxiduct_bytes_total counter"));
+    }
+
+    #[tokio::test]
+    async fn request_line_split_across_reads_still_served() {
+        let m = Metrics::new();
+        m.connections_total.with_label_values(&["p1", "tcp"]).inc();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_request(stream, &m).await.unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Dribble the request line in two chunks with a pause between.
+        client.write_all(b"GET /met").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(b"rics HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(text.contains("oxiduct_connections_total"));
+        server.await.unwrap();
     }
 
     #[test]
