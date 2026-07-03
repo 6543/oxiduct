@@ -54,122 +54,96 @@ pub struct ProxyConfig {
     pub proxy_protocol: bool,
 }
 
-// ── TOML shapes ──────────────────────────────────────────────────────────────
+// ── Tuning knobs (single source of truth) ────────────────────────────────────
 
-/// Optional tuning knobs. Used for the `[defaults]` table and, field-for-field,
-/// inside each `[[proxy]]`. `None` means "inherit from defaults, then const".
+/// Declares every tuning knob exactly once:
 ///
-/// `#[serde(flatten)]` is intentionally NOT used here: it is unreliable for
-/// typed/integer fields with the `toml` crate. Each proxy lists the knobs
-/// explicitly and converts into this struct via [`TomlProxy::tuning`].
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TomlTuning {
-    connect_timeout: Option<u64>,
-    keepalive_idle: Option<u64>,
-    keepalive_interval: Option<u64>,
-    keepalive_retries: Option<u32>,
-    user_timeout_ms: Option<u32>,
-    idle_timeout: Option<u64>,
-    half_close_timeout: Option<u64>,
-    max_connections: Option<u32>,
-    max_per_ip: Option<u32>,
-    proxy_protocol: Option<bool>,
-}
-
-impl TomlTuning {
-    /// Resolve into concrete values: per-proxy override → `[defaults]` → const.
-    fn resolve(self, base: TomlTuning) -> ResolvedTuning {
-        ResolvedTuning {
-            connect_timeout_secs: self
-                .connect_timeout
-                .or(base.connect_timeout)
-                .unwrap_or(defaults::CONNECT_TIMEOUT_SECS),
-            keepalive_idle_secs: self
-                .keepalive_idle
-                .or(base.keepalive_idle)
-                .unwrap_or(defaults::KEEPALIVE_IDLE_SECS),
-            keepalive_interval_secs: self
-                .keepalive_interval
-                .or(base.keepalive_interval)
-                .unwrap_or(defaults::KEEPALIVE_INTERVAL_SECS),
-            keepalive_retries: self
-                .keepalive_retries
-                .or(base.keepalive_retries)
-                .unwrap_or(defaults::KEEPALIVE_RETRIES),
-            user_timeout_ms: self
-                .user_timeout_ms
-                .or(base.user_timeout_ms)
-                .unwrap_or(defaults::USER_TIMEOUT_MS),
-            idle_timeout_secs: self
-                .idle_timeout
-                .or(base.idle_timeout)
-                .unwrap_or(defaults::IDLE_TIMEOUT_SECS),
-            half_close_timeout_secs: self
-                .half_close_timeout
-                .or(base.half_close_timeout)
-                .unwrap_or(defaults::HALF_CLOSE_TIMEOUT_SECS),
-            max_connections: self
-                .max_connections
-                .or(base.max_connections)
-                .unwrap_or(defaults::MAX_CONNECTIONS),
-            max_per_ip: self
-                .max_per_ip
-                .or(base.max_per_ip)
-                .unwrap_or(defaults::MAX_PER_IP),
-            proxy_protocol: self.proxy_protocol.or(base.proxy_protocol).unwrap_or(false),
+/// ```text
+/// TOML/CLI key => ProxyConfig field : type = built-in default
+/// ```
+///
+/// and generates all the plumbing around it: the `[defaults]` table shape
+/// (`TomlTuning`), the `[[proxy]]` entry shape (`TomlProxy`), and the
+/// CLI/TOML → [`ProxyConfig`] constructors. Adding a knob means adding one
+/// line here, the concrete field on [`ProxyConfig`], and the clap arg on
+/// [`Args`] — nothing else.
+macro_rules! tuning_knobs {
+    ($( $toml:ident => $cfg:ident : $ty:ty = $default:expr ),+ $(,)?) => {
+        /// Optional tuning knobs for the `[defaults]` table.
+        /// `None` means "inherit from built-in defaults".
+        #[derive(Debug, Clone, Copy, Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TomlTuning {
+            $( $toml: Option<$ty>, )+
         }
-    }
-}
 
-struct ResolvedTuning {
-    connect_timeout_secs: u64,
-    keepalive_idle_secs: u64,
-    keepalive_interval_secs: u64,
-    keepalive_retries: u32,
-    user_timeout_ms: u32,
-    idle_timeout_secs: u64,
-    half_close_timeout_secs: u64,
-    max_connections: u32,
-    max_per_ip: u32,
-    proxy_protocol: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TomlProxy {
-    name: Option<String>,
-    listen: String,
-    target: String,
-    #[serde(default)]
-    protocol: Protocol,
-    connect_timeout: Option<u64>,
-    keepalive_idle: Option<u64>,
-    keepalive_interval: Option<u64>,
-    keepalive_retries: Option<u32>,
-    user_timeout_ms: Option<u32>,
-    idle_timeout: Option<u64>,
-    half_close_timeout: Option<u64>,
-    max_connections: Option<u32>,
-    max_per_ip: Option<u32>,
-    proxy_protocol: Option<bool>,
-}
-
-impl TomlProxy {
-    fn tuning(&self) -> TomlTuning {
-        TomlTuning {
-            connect_timeout: self.connect_timeout,
-            keepalive_idle: self.keepalive_idle,
-            keepalive_interval: self.keepalive_interval,
-            keepalive_retries: self.keepalive_retries,
-            user_timeout_ms: self.user_timeout_ms,
-            idle_timeout: self.idle_timeout,
-            half_close_timeout: self.half_close_timeout,
-            max_connections: self.max_connections,
-            max_per_ip: self.max_per_ip,
-            proxy_protocol: self.proxy_protocol,
+        /// One `[[proxy]]` entry. The knobs are listed explicitly rather than
+        /// `#[serde(flatten)]`-ing `TomlTuning`: flatten silently disables
+        /// `deny_unknown_fields` and is unreliable for typed/integer fields
+        /// with the `toml` crate.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TomlProxy {
+            name: Option<String>,
+            listen: String,
+            target: String,
+            #[serde(default)]
+            protocol: Protocol,
+            $( $toml: Option<$ty>, )+
         }
-    }
+
+        impl ProxyConfig {
+            /// Build a single-proxy config from CLI args.
+            pub fn from_cli(args: &Args) -> Result<Self> {
+                let listen = args
+                    .listen
+                    .clone()
+                    .map(|s| cli::expand_listen(&s))
+                    .ok_or_else(|| anyhow::anyhow!("--listen required in single-proxy mode"))?;
+                let target = args
+                    .target
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("--target required in single-proxy mode"))?;
+
+                Ok(Self {
+                    name: format!("{listen} -> {target}"),
+                    listen,
+                    target,
+                    protocol: parse_protocol(&args.protocol)?,
+                    $( $cfg: args.$toml, )+
+                })
+            }
+
+            /// Resolve one TOML entry: per-proxy value → `[defaults]` → const.
+            fn from_toml(index: usize, p: TomlProxy, base: TomlTuning) -> Self {
+                let listen = cli::expand_listen(&p.listen);
+                let name = p
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("proxy-{index}: {listen} -> {}", p.target));
+                Self {
+                    name,
+                    listen,
+                    protocol: p.protocol,
+                    $( $cfg: p.$toml.or(base.$toml).unwrap_or($default), )+
+                    target: p.target,
+                }
+            }
+        }
+    };
+}
+
+tuning_knobs! {
+    connect_timeout    => connect_timeout_secs:    u64  = defaults::CONNECT_TIMEOUT_SECS,
+    keepalive_idle     => keepalive_idle_secs:     u64  = defaults::KEEPALIVE_IDLE_SECS,
+    keepalive_interval => keepalive_interval_secs: u64  = defaults::KEEPALIVE_INTERVAL_SECS,
+    keepalive_retries  => keepalive_retries:       u32  = defaults::KEEPALIVE_RETRIES,
+    user_timeout_ms    => user_timeout_ms:         u32  = defaults::USER_TIMEOUT_MS,
+    idle_timeout       => idle_timeout_secs:       u64  = defaults::IDLE_TIMEOUT_SECS,
+    half_close_timeout => half_close_timeout_secs: u64  = defaults::HALF_CLOSE_TIMEOUT_SECS,
+    max_connections    => max_connections:         u32  = defaults::MAX_CONNECTIONS,
+    max_per_ip         => max_per_ip:              u32  = defaults::MAX_PER_IP,
+    proxy_protocol     => proxy_protocol:          bool = false,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,65 +162,6 @@ struct TomlFile {
 pub struct LoadedConfig {
     pub proxies: Vec<ProxyConfig>,
     pub metrics_listen: Option<String>,
-}
-
-// ── Constructors ─────────────────────────────────────────────────────────────
-
-impl ProxyConfig {
-    /// Build a single-proxy config from CLI args.
-    pub fn from_cli(args: &Args) -> Result<Self> {
-        let listen = args
-            .listen
-            .clone()
-            .map(|s| cli::expand_listen(&s))
-            .ok_or_else(|| anyhow::anyhow!("--listen required in single-proxy mode"))?;
-        let target = args
-            .target
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--target required in single-proxy mode"))?;
-
-        Ok(Self {
-            name: format!("{listen} -> {target}"),
-            listen,
-            target,
-            protocol: parse_protocol(&args.protocol)?,
-            connect_timeout_secs: args.connect_timeout,
-            keepalive_idle_secs: args.keepalive_idle,
-            keepalive_interval_secs: args.keepalive_interval,
-            keepalive_retries: args.keepalive_retries,
-            user_timeout_ms: args.user_timeout_ms,
-            idle_timeout_secs: args.idle_timeout,
-            half_close_timeout_secs: args.half_close_timeout,
-            max_connections: args.max_connections,
-            max_per_ip: args.max_per_ip,
-            proxy_protocol: args.proxy_protocol,
-        })
-    }
-
-    fn from_toml(index: usize, p: TomlProxy, base: TomlTuning) -> Self {
-        let listen = cli::expand_listen(&p.listen);
-        let name = p
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("proxy-{index}: {listen} -> {}", p.target));
-        let t = p.tuning().resolve(base);
-        Self {
-            name,
-            listen,
-            target: p.target,
-            protocol: p.protocol,
-            connect_timeout_secs: t.connect_timeout_secs,
-            keepalive_idle_secs: t.keepalive_idle_secs,
-            keepalive_interval_secs: t.keepalive_interval_secs,
-            keepalive_retries: t.keepalive_retries,
-            user_timeout_ms: t.user_timeout_ms,
-            idle_timeout_secs: t.idle_timeout_secs,
-            half_close_timeout_secs: t.half_close_timeout_secs,
-            max_connections: t.max_connections,
-            max_per_ip: t.max_per_ip,
-            proxy_protocol: t.proxy_protocol,
-        }
-    }
 }
 
 /// Load and resolve every `[[proxy]]` entry from a TOML config file.
