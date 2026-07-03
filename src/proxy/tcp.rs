@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
-use crate::limits::{ConnLimits, Reject};
+use crate::limits::ConnLimits;
 use crate::metrics::Metrics;
 use crate::socket_opts;
 
@@ -99,27 +99,18 @@ pub async fn serve(
                 Ok((stream, peer)) => {
                     let guard = match limits.try_acquire(peer.ip()) {
                         Ok(g) => g,
-                        Err(Reject::Total) => {
+                        Err(rej) => {
+                            // error! level + src_ip field so log scrapers
+                            // (fail2ban etc.) can match rejected sources.
                             error!(
                                 proxy = %cfg.name,
                                 src_ip = %peer.ip(),
-                                limit = limits.max_total,
-                                "TCP connection rejected: total limit reached"
+                                limit = rej.limit(&limits),
+                                reason = rej.label(),
+                                "TCP connection rejected: limit reached"
                             );
                             metrics.connections_rejected
-                                .with_label_values(&[cfg.name.as_str(), "total"]).inc();
-                            drop(stream);
-                            continue;
-                        }
-                        Err(Reject::PerIp) => {
-                            error!(
-                                proxy = %cfg.name,
-                                src_ip = %peer.ip(),
-                                limit = limits.max_per_ip,
-                                "TCP connection rejected: per-IP limit reached"
-                            );
-                            metrics.connections_rejected
-                                .with_label_values(&[cfg.name.as_str(), "per_ip"]).inc();
+                                .with_label_values(&[cfg.name.as_str(), rej.label()]).inc();
                             drop(stream);
                             continue;
                         }

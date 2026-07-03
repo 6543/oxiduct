@@ -27,6 +27,24 @@ pub enum Reject {
     PerIp,
 }
 
+impl Reject {
+    /// Stable label for logs and the `reason` metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Reject::Total => "total",
+            Reject::PerIp => "per_ip",
+        }
+    }
+
+    /// The configured cap that was hit.
+    pub fn limit(self, limits: &ConnLimits) -> u32 {
+        match self {
+            Reject::Total => limits.max_total,
+            Reject::PerIp => limits.max_per_ip,
+        }
+    }
+}
+
 /// RAII slot. Drop releases the slot back to the pool.
 pub struct Guard {
     limits: Arc<ConnLimits>,

@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clock::now_ms;
 use crate::config::ProxyConfig;
-use crate::limits::{ConnLimits, Guard, Reject};
+use crate::limits::{ConnLimits, Guard};
 use crate::metrics::Metrics;
 
 // ── Session ────────────────────────────────────────────────────────────────
@@ -173,26 +173,18 @@ pub async fn serve(
                 // listener (and every other session) for a hostile/slow target.
                 let slot = match limits.try_acquire(src.ip()) {
                     Ok(g) => g,
-                    Err(Reject::Total) => {
+                    Err(rej) => {
+                        // error! level + src_ip field so log scrapers
+                        // (fail2ban etc.) can match rejected sources.
                         error!(
                             proxy = %cfg.name,
                             src_ip = %src.ip(),
-                            limit = limits.max_total,
-                            "UDP session rejected: total limit reached"
+                            limit = rej.limit(&limits),
+                            reason = rej.label(),
+                            "UDP session rejected: limit reached"
                         );
                         metrics.connections_rejected
-                            .with_label_values(&[cfg.name.as_str(), "total"]).inc();
-                        continue;
-                    }
-                    Err(Reject::PerIp) => {
-                        error!(
-                            proxy = %cfg.name,
-                            src_ip = %src.ip(),
-                            limit = limits.max_per_ip,
-                            "UDP session rejected: per-IP limit reached"
-                        );
-                        metrics.connections_rejected
-                            .with_label_values(&[cfg.name.as_str(), "per_ip"]).inc();
+                            .with_label_values(&[cfg.name.as_str(), rej.label()]).inc();
                         continue;
                     }
                 };
