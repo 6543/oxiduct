@@ -150,6 +150,8 @@ pub async fn serve(addr: String, metrics: Arc<Metrics>, shutdown: CancellationTo
                     Ok(v) => v,
                     Err(e) => {
                         warn!("metrics accept error: {e}");
+                        // Back off so fd exhaustion can't spin the loop hot.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };

@@ -30,6 +30,8 @@ use super::proxy_protocol;
 const BUF_SIZE: usize = 16 * 1024;
 /// How often the watchdog re-checks the idle / half-close deadlines.
 const WATCHDOG_TICK: Duration = Duration::from_secs(5);
+/// Pause after a failed accept() so fd exhaustion can't spin the loop hot.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Monotonically increasing connection ID for log correlation.
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -128,7 +130,12 @@ pub async fn serve(
                         handle(id, stream, peer, cfg, metrics, token).await
                     });
                 }
-                Err(e) => warn!(proxy = %cfg.name, "accept error: {e}"), // non-fatal
+                // Non-fatal (e.g. EMFILE under fd pressure), but back off
+                // briefly so a persistent error can't spin this loop hot.
+                Err(e) => {
+                    warn!(proxy = %cfg.name, "accept error: {e}");
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
             }
         }
     }
