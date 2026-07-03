@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use tokio::signal;
+use tokio::task::JoinSet;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -35,14 +36,12 @@ async fn main() -> Result<()> {
 
     let shutdown = CancellationToken::new();
     let stats = metrics::Metrics::new();
-    let mut handles = Vec::with_capacity(proxies.len() + 1);
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
     // Optional Prometheus exporter. Treated like a proxy task: if it fails to
     // bind, startup aborts with a non-zero exit.
     if let Some(addr) = metrics_listen {
-        let stats = stats.clone();
-        let token = shutdown.clone();
-        handles.push(tokio::spawn(metrics::serve(addr, stats, token)));
+        tasks.spawn(metrics::serve(addr, stats.clone(), shutdown.clone()));
     }
 
     for cfg in proxies {
@@ -57,19 +56,25 @@ async fn main() -> Result<()> {
             max_per_ip = cfg.max_per_ip,
             "resolved config"
         );
-        let token = shutdown.clone();
-        handles.push(tokio::spawn(proxy::run(cfg, stats.clone(), token)));
+        tasks.spawn(proxy::run(cfg, stats.clone(), shutdown.clone()));
     }
 
     tokio::select! {
-        // A proxy task that exits early means bind failed — abort immediately.
-        result = wait_any(&mut handles) => {
-            if let Err(e) = result {
-                tracing::error!("proxy failed: {e:#}");
-                std::process::exit(1);
+        // A task finishing before any signal means a bind failure or an
+        // unexpected exit — abort immediately.
+        finished = tasks.join_next() => {
+            match finished {
+                Some(Ok(Err(e))) => {
+                    tracing::error!("proxy failed: {e:#}");
+                    std::process::exit(1);
+                }
+                Some(Err(e)) => {
+                    tracing::error!("proxy task panicked: {e}");
+                    std::process::exit(1);
+                }
+                // Clean early exit (shouldn't happen normally) or empty set.
+                Some(Ok(Ok(()))) | None => return Ok(()),
             }
-            // All proxies exited cleanly without a signal (shouldn't happen normally).
-            return Ok(());
         }
         _ = signal::ctrl_c() => info!("received SIGINT"),
         _ = sigterm()        => info!("received SIGTERM"),
@@ -81,8 +86,8 @@ async fn main() -> Result<()> {
 
     let mut any_error = false;
     let _ = tokio::time::timeout(grace, async {
-        for h in handles {
-            match h.await {
+        while let Some(finished) = tasks.join_next().await {
+            match finished {
                 Ok(Err(e)) => {
                     tracing::error!("proxy error: {e:#}");
                     any_error = true;
@@ -102,25 +107,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// Wait for the first handle to finish. Returns its result (or the join error).
-async fn wait_any(handles: &mut [tokio::task::JoinHandle<Result<()>>]) -> Result<()> {
-    loop {
-        let mut all_done = true;
-        for h in handles.iter_mut() {
-            if h.is_finished() {
-                return h
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("task panicked: {e}")));
-            }
-            all_done = false;
-        }
-        if all_done {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 #[cfg(unix)]
