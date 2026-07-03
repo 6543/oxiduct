@@ -52,7 +52,7 @@ That's it. Logs go to stdout. Press Ctrl-C or send `SIGTERM` to shut down gracef
 | L1 | TCP keepalive probes at the kernel level | Every 10s, 6 retries |
 | L2 | Force-close unacknowledged connections (`TCP_USER_TIMEOUT`, Linux) | After 90s |
 | L3 | Close if no data flows in either direction | After 5 min |
-| L4 | If one side closes, give the other side a deadline | 30s grace |
+| L4 | If one side closes and the other goes silent, close it | 30s grace |
 
 Any one of these is usually enough. Together they cover virtually every dead-connection scenario.
 

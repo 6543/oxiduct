@@ -158,6 +158,38 @@ async fn half_close_timeout_kills_stuck_server() {
 }
 
 #[tokio::test]
+async fn half_close_grace_spares_active_transfer() {
+    // Server streams for ~3s (10 × 300ms), well past the 1s grace. The client
+    // half-closes immediately after connecting; the ongoing download must
+    // still complete because activity keeps resetting the L4 deadline.
+    let chunk: &[u8] = b"0123456789abcdef";
+    let server = spawn_tcp_slow_stream(chunk, 10, 300).await;
+    let mut cfg = cfg_tcp(server);
+    cfg.idle_timeout_secs = 0;
+    cfg.half_close_timeout_secs = 1;
+    let proxy = spawn_tcp_proxy(cfg).await;
+
+    let mut conn = TcpStream::connect(proxy.addr).await.unwrap();
+    // Nudge the handler to connect upstream, then half-close our write side.
+    conn.write_all(b"x").await.unwrap();
+    conn.shutdown().await.unwrap();
+
+    let mut all = Vec::new();
+    let n = tokio::time::timeout(Duration::from_secs(15), conn.read_to_end(&mut all))
+        .await
+        .expect("download never finished")
+        .unwrap();
+
+    assert_eq!(
+        n,
+        chunk.len() * 10,
+        "download was cut short by half_close_timeout"
+    );
+
+    proxy.stop().await;
+}
+
+#[tokio::test]
 async fn idle_zero_disables_timeout() {
     let blackhole = spawn_tcp_blackhole().await;
     let mut cfg = cfg_tcp(blackhole);

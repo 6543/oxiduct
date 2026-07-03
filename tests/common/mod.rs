@@ -116,6 +116,36 @@ pub async fn spawn_tcp_send_then_hold(msg: &'static [u8]) -> SocketAddr {
     addr
 }
 
+/// TCP server that streams `count` copies of `chunk`, pausing `interval_ms`
+/// between them, then closes. Ignores anything the client sends. Simulates a
+/// long-running download for half-close tests.
+pub async fn spawn_tcp_slow_stream(
+    chunk: &'static [u8],
+    count: usize,
+    interval_ms: u64,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                for _ in 0..count {
+                    if stream.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+                // Dropping the stream closes it cleanly.
+            });
+        }
+    });
+    addr
+}
+
 /// UDP echo server. Echoes any received datagram back to its sender.
 pub async fn spawn_udp_echo() -> SocketAddr {
     let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

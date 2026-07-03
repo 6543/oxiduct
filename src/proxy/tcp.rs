@@ -4,7 +4,7 @@
 //!   L1 – SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT   (socket_opts)
 //!   L2 – TCP_USER_TIMEOUT                                              (socket_opts, Linux)
 //!   L3 – Application idle timeout  (no bytes either direction → kill)
-//!   L4 – Half-close grace          (one side EOF → deadline on other)
+//!   L4 – Half-close grace          (one side EOF → other must show activity)
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -366,7 +366,8 @@ async fn watchdog(
         }
         if half_close_secs > 0 {
             if let Some(since) = half_close_since {
-                let deadline = since.saturating_add(half_close_secs.saturating_mul(1000));
+                let base = since.max(last_activity.load(Ordering::Relaxed));
+                let deadline = base.saturating_add(half_close_secs.saturating_mul(1000));
                 wake_ms = wake_ms.min(deadline.saturating_sub(now));
             }
         }
@@ -410,10 +411,16 @@ async fn watchdog(
         }
 
         // L4: half-close grace period. Directions never "un-finish", so the
-        // deadline is armed once, on the first finished direction.
+        // grace is armed once, on the first finished direction. The deadline
+        // is measured from the *last activity* (or the arm time, whichever is
+        // later), so a surviving direction that is still moving data — e.g. a
+        // client that sent its request, shut down its write side and is now
+        // downloading a large response — is never killed mid-transfer. Only a
+        // half-open connection that also went silent for the grace period is.
         if half_close_secs > 0 && (up_done || down_done) {
             let since = *half_close_since.get_or_insert(now);
-            if now.saturating_sub(since) >= half_close_secs.saturating_mul(1000) {
+            let base = since.max(last_activity.load(Ordering::Relaxed));
+            if now.saturating_sub(base) >= half_close_secs.saturating_mul(1000) {
                 cancel.cancel();
                 return "half_close_timeout";
             }
