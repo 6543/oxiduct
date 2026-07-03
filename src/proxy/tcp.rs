@@ -313,12 +313,14 @@ where
                 }
                 Ok(n) => {
                     last_activity.store(now_ms(), Ordering::Relaxed);
-                    total += n as u64;
                     if let Err(e) = writer.write_all(&buf[..n]).await {
                         debug!(id, dir = dir.label(), "write: {e}");
                         end = End::Err;
                         break;
                     }
+                    // Count only bytes actually relayed, so the close log and
+                    // the Prometheus counter always agree.
+                    total += n as u64;
                     bytes.inc_by(n as u64);
                 }
                 Err(e) => {
@@ -409,15 +411,14 @@ async fn watchdog(
             }
         }
 
-        // L4: half-close grace period.
+        // L4: half-close grace period. Directions never "un-finish", so the
+        // deadline is armed once, on the first finished direction.
         if half_close_secs > 0 && (up_done || down_done) {
             let since = *half_close_since.get_or_insert(now);
             if now.saturating_sub(since) >= half_close_secs.saturating_mul(1000) {
                 cancel.cancel();
                 return "half_close_timeout";
             }
-        } else if !up_done && !down_done {
-            half_close_since = None;
         }
     }
 }
