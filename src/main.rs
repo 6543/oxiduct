@@ -14,11 +14,10 @@ use oxiduct::{cli, config, metrics, proxy};
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
 
+    // clap already resolves RUST_LOG vs --log-level (env attr on the flag),
+    // so one EnvFilter built from the resolved value is the whole story.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level)),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&args.log_level))
         .init();
 
     // Resolve proxies + global settings. CLI flags win over the TOML keys
