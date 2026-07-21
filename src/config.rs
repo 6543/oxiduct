@@ -771,6 +771,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_tcp_and_udp_on_same_listen_address() {
+        let cfgs = load_str(
+            r#"
+            [[proxy]]
+            listen   = "127.0.0.1:53"
+            target   = "a:53"
+            protocol = "tcp"
+
+            [[proxy]]
+            listen   = "127.0.0.1:53"
+            target   = "b:53"
+            protocol = "udp"
+            "#,
+        )
+        .expect("TCP and UDP may bind the same address");
+
+        assert_eq!(cfgs.len(), 2);
+    }
+
+    #[test]
     fn from_cli_zero_connect_timeout_errors() {
         let mut args = args_with(Some("1"), Some("a:1"), Protocol::Tcp);
         args.connect_timeout = 0;
