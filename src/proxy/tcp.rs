@@ -311,7 +311,12 @@ where
                 }
                 Ok(n) => {
                     last_activity.store(now_ms(), Ordering::Relaxed);
-                    if let Err(e) = writer.write_all(&buf[..n]).await {
+                    let written = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        result = writer.write_all(&buf[..n]) => result,
+                    };
+                    if let Err(e) = written {
                         debug!(id, dir = dir.label(), "write: {e}");
                         end = End::Err;
                         break;
