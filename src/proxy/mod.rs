@@ -34,11 +34,7 @@ pub async fn run_graceful(
         .set(cfg.max_per_ip as i64);
 
     match cfg.protocol {
-        Protocol::Tcp => {
-            tcp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await
-        }
-        Protocol::Udp => {
-            udp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await
-        }
+        Protocol::Tcp => tcp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await,
+        Protocol::Udp => udp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await,
     }
 }

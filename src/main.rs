@@ -44,11 +44,7 @@ async fn main() -> Result<()> {
     // Optional Prometheus exporter. Treated like a proxy task: if it fails to
     // bind, startup aborts with a non-zero exit.
     if let Some(addr) = metrics_listen {
-        tasks.spawn(metrics::serve(
-            addr,
-            stats.clone(),
-            stop_accepting.clone(),
-        ));
+        tasks.spawn(metrics::serve(addr, stats.clone(), stop_accepting.clone()));
     }
 
     for cfg in proxies {
@@ -115,7 +111,10 @@ async fn main() -> Result<()> {
     .await;
 
     if graceful.is_err() {
-        info!(?grace, "shutdown grace elapsed, force-closing active sessions");
+        info!(
+            ?grace,
+            "shutdown grace elapsed, force-closing active sessions"
+        );
         force_shutdown.cancel();
         while let Some(finished) = tasks.join_next().await {
             match finished {

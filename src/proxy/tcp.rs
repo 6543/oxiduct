@@ -85,14 +85,7 @@ pub async fn run_graceful(
         .with_context(|| format!("bind {}", cfg.listen))?;
 
     info!(proxy = %cfg.name, "TCP listening");
-    serve_graceful(
-        listener,
-        cfg,
-        metrics,
-        stop_accepting,
-        force_shutdown,
-    )
-    .await
+    serve_graceful(listener, cfg, metrics, stop_accepting, force_shutdown).await
 }
 
 /// Run the accept loop on a pre-bound listener.

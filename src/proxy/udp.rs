@@ -73,14 +73,7 @@ pub async fn run_graceful(
     );
 
     info!(proxy = %cfg.name, "UDP listening");
-    serve_graceful(
-        listen_sock,
-        cfg,
-        metrics,
-        stop_accepting,
-        force_shutdown,
-    )
-    .await
+    serve_graceful(listen_sock, cfg, metrics, stop_accepting, force_shutdown).await
 }
 
 /// Run the UDP relay on a pre-bound socket.
@@ -93,14 +86,7 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    serve_graceful(
-        listen_sock,
-        cfg,
-        metrics,
-        shutdown.clone(),
-        shutdown,
-    )
-    .await
+    serve_graceful(listen_sock, cfg, metrics, shutdown.clone(), shutdown).await
 }
 
 pub async fn serve_graceful(
