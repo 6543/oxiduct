@@ -14,6 +14,15 @@ pub async fn run(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    run_graceful(cfg, metrics, shutdown.clone(), shutdown).await
+}
+
+pub async fn run_graceful(
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    stop_accepting: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
     // Publish the configured limits as gauges up front.
     metrics
         .limit_max_connections
@@ -25,7 +34,11 @@ pub async fn run(
         .set(cfg.max_per_ip as i64);
 
     match cfg.protocol {
-        Protocol::Tcp => tcp::run(cfg, metrics, shutdown).await,
-        Protocol::Udp => udp::run(cfg, metrics, shutdown).await,
+        Protocol::Tcp => {
+            tcp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await
+        }
+        Protocol::Udp => {
+            udp::run_graceful(cfg, metrics, stop_accepting, force_shutdown).await
+        }
     }
 }

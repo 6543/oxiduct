@@ -57,6 +57,15 @@ pub async fn run(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    run_graceful(cfg, metrics, shutdown.clone(), shutdown).await
+}
+
+pub async fn run_graceful(
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    stop_accepting: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
     let listen_sock = Arc::new(
         UdpSocket::bind(&cfg.listen)
             .await
@@ -64,7 +73,14 @@ pub async fn run(
     );
 
     info!(proxy = %cfg.name, "UDP listening");
-    serve(listen_sock, cfg, metrics, shutdown).await
+    serve_graceful(
+        listen_sock,
+        cfg,
+        metrics,
+        stop_accepting,
+        force_shutdown,
+    )
+    .await
 }
 
 /// Run the UDP relay on a pre-bound socket.
@@ -77,10 +93,28 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_graceful(
+        listen_sock,
+        cfg,
+        metrics,
+        shutdown.clone(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_graceful(
+    listen_sock: Arc<UdpSocket>,
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    stop_accepting: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
     // Sources with a session-setup task in flight (see PendingGuard).
     let pending: Arc<StdMutex<HashSet<SocketAddr>>> = Arc::new(StdMutex::new(HashSet::new()));
     let cleanup_wakeup = Arc::new(Notify::new());
+    let cleanup_shutdown = force_shutdown.child_token();
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
     let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
 
@@ -91,7 +125,7 @@ pub async fn serve(
     {
         let sessions2 = sessions.clone();
         let idle_secs = cfg.idle_timeout_secs;
-        let shut = shutdown.clone();
+        let shut = cleanup_shutdown.clone();
         let closed_idle = metrics
             .connections_closed
             .with_label_values(&[cfg.name.as_str(), "idle_timeout"]);
@@ -154,12 +188,13 @@ pub async fn serve(
     }
 
     let mut recv_buf = vec![0u8; 65535];
+    let mut draining = false;
 
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => {
-                info!(proxy = %cfg.name, "UDP listener shutting down");
+            _ = force_shutdown.cancelled() => {
+                info!(proxy = %cfg.name, "UDP sessions shutting down");
                 // Cancel all live sessions
                 let map = sessions.lock().await;
                 for s in map.values() {
@@ -171,6 +206,18 @@ pub async fn serve(
                 closed.inc_by(map.len() as u64);
                 active.set(0);
                 break;
+            }
+            _ = stop_accepting.cancelled(), if !draining => {
+                draining = true;
+                info!(proxy = %cfg.name, "UDP listener draining existing sessions");
+            }
+            _ = sleep(Duration::from_millis(100)), if draining => {
+                let no_sessions = sessions.lock().await.is_empty();
+                let no_pending = pending.lock().expect("pending mutex poisoned").is_empty();
+                if no_sessions && no_pending {
+                    info!(proxy = %cfg.name, "UDP listener drained");
+                    break;
+                }
             }
             result = listen_sock.recv_from(&mut recv_buf) => {
                 let (n, src) = match result {
@@ -211,6 +258,11 @@ pub async fn serve(
                         }
                         None => {}
                     }
+                }
+
+                if draining {
+                    debug!(%src, "UDP listener draining, new session packet dropped");
+                    continue;
                 }
 
                 // Slow path: first packet from this source. Admit, then build
@@ -257,19 +309,32 @@ pub async fn serve(
                 let metrics = metrics.clone();
                 let sessions = sessions.clone();
                 let listen_sock = listen_sock.clone();
-                let shutdown = shutdown.clone();
+                let force_shutdown = force_shutdown.clone();
                 let active = active.clone();
                 let cleanup_wakeup = cleanup_wakeup.clone();
                 tokio::spawn(async move {
                     // Cleared when this task ends, whatever the outcome.
                     let _pending = pending_guard;
-                    let session = match open_session(src, &cfg, &metrics, listen_sock, shutdown, slot).await {
+                    let session = match open_session(
+                        src,
+                        &cfg,
+                        &metrics,
+                        listen_sock,
+                        force_shutdown.clone(),
+                        slot,
+                    ).await {
                         Ok(s) => s,
                         Err(e) => {
-                            warn!(%src, "UDP session open failed: {e:#}");
+                            if !force_shutdown.is_cancelled() {
+                                warn!(%src, "UDP session open failed: {e:#}");
+                            }
                             return;
                         }
                     };
+                    if force_shutdown.is_cancelled() {
+                        session.cancel.cancel();
+                        return;
+                    }
 
                     // Insert. Another packet from the same source may have
                     // raced us to create a session while we were resolving; if
@@ -296,6 +361,7 @@ pub async fn serve(
             }
         }
     }
+    cleanup_shutdown.cancel();
     Ok(())
 }
 
@@ -312,28 +378,30 @@ async fn open_session(
     // Resolve + bind + connect, all under one connect-timeout budget. DNS in
     // particular has no inherent bound and must not be allowed to hang a
     // session-setup task forever.
-    let upstream = tokio::time::timeout(Duration::from_secs(cfg.connect_timeout_secs), async {
-        // Resolve target to know which IP family to bind the upstream socket to
-        let target_addr = tokio::net::lookup_host(&cfg.target)
-            .await
-            .with_context(|| format!("DNS lookup {}", cfg.target))?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no address resolved for {}", cfg.target))?;
+    let upstream = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => anyhow::bail!("UDP session setup cancelled"),
+        result = tokio::time::timeout(Duration::from_secs(cfg.connect_timeout_secs), async {
+            // Resolve target to know which IP family to bind the upstream socket to
+            let target_addr = tokio::net::lookup_host(&cfg.target)
+                .await
+                .with_context(|| format!("DNS lookup {}", cfg.target))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no address resolved for {}", cfg.target))?;
 
-        let bind_addr: SocketAddr = if target_addr.is_ipv6() {
-            "[::]:0".parse().unwrap()
-        } else {
-            "0.0.0.0:0".parse().unwrap()
-        };
+            let bind_addr: SocketAddr = if target_addr.is_ipv6() {
+                "[::]:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            };
 
-        let upstream = UdpSocket::bind(bind_addr)
-            .await
-            .context("UDP upstream bind")?;
-        upstream.connect(target_addr).await.context("UDP connect")?;
-        Ok::<_, anyhow::Error>(Arc::new(upstream))
-    })
-    .await
-    .context("UDP session setup timed out")??;
+            let upstream = UdpSocket::bind(bind_addr)
+                .await
+                .context("UDP upstream bind")?;
+            upstream.connect(target_addr).await.context("UDP connect")?;
+            Ok::<_, anyhow::Error>(Arc::new(upstream))
+        }) => result.context("UDP session setup timed out")??,
+    };
 
     info!(%src, target = %cfg.target, "UDP session opened");
 

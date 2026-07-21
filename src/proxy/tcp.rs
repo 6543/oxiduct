@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -70,12 +71,28 @@ pub async fn run(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    run_graceful(cfg, metrics, shutdown.clone(), shutdown).await
+}
+
+pub async fn run_graceful(
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    stop_accepting: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
 
     info!(proxy = %cfg.name, "TCP listening");
-    serve(listener, cfg, metrics, shutdown).await
+    serve_graceful(
+        listener,
+        cfg,
+        metrics,
+        stop_accepting,
+        force_shutdown,
+    )
+    .await
 }
 
 /// Run the accept loop on a pre-bound listener.
@@ -88,14 +105,30 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_graceful(listener, cfg, metrics, shutdown.clone(), shutdown).await
+}
+
+pub async fn serve_graceful(
+    listener: TcpListener,
+    cfg: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
+    stop_accepting: CancellationToken,
+    force_shutdown: CancellationToken,
+) -> Result<()> {
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => {
+            _ = stop_accepting.cancelled() => {
                 info!(proxy = %cfg.name, "TCP listener shutting down");
                 break;
+            }
+            finished = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(e)) = finished {
+                    warn!(proxy = %cfg.name, "TCP connection task panicked: {e}");
+                }
             }
             result = listener.accept() => match result {
                 Ok((stream, peer)) => {
@@ -124,8 +157,8 @@ pub async fn serve(
                     let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
                     let cfg = cfg.clone();
                     let metrics = metrics.clone();
-                    let token = shutdown.child_token();
-                    tokio::spawn(async move {
+                    let token = force_shutdown.child_token();
+                    connections.spawn(async move {
                         let _guard = guard; // released on task end
                         handle(id, stream, peer, cfg, metrics, token).await
                     });
@@ -137,6 +170,12 @@ pub async fn serve(
                     sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
             }
+        }
+    }
+
+    while let Some(finished) = connections.join_next().await {
+        if let Err(e) = finished {
+            warn!(proxy = %cfg.name, "TCP connection task panicked: {e}");
         }
     }
     Ok(())
@@ -154,12 +193,15 @@ async fn handle(
 ) {
     socket_opts::apply_tcp(&inbound, &cfg);
 
-    let mut outbound = match tokio::time::timeout(
-        Duration::from_secs(cfg.connect_timeout_secs),
-        TcpStream::connect(&cfg.target),
-    )
-    .await
-    {
+    let connected = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return,
+        result = tokio::time::timeout(
+            Duration::from_secs(cfg.connect_timeout_secs),
+            TcpStream::connect(&cfg.target),
+        ) => result,
+    };
+    let mut outbound = match connected {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
@@ -189,7 +231,12 @@ async fn handle(
     if cfg.proxy_protocol {
         let dst = inbound.local_addr().unwrap_or(peer);
         let header = proxy_protocol::v2_header(peer, dst);
-        if let Err(e) = outbound.write_all(&header).await {
+        let written = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            result = outbound.write_all(&header) => result,
+        };
+        if let Err(e) = written {
             warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "PROXY protocol header write failed: {e}");
             metrics
                 .connect_failures

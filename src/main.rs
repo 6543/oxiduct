@@ -36,14 +36,19 @@ async fn main() -> Result<()> {
     };
     let shutdown_grace = shutdown_grace.unwrap_or(config::defaults::SHUTDOWN_GRACE_SECS);
 
-    let shutdown = CancellationToken::new();
+    let stop_accepting = CancellationToken::new();
+    let force_shutdown = CancellationToken::new();
     let stats = metrics::Metrics::new();
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
     // Optional Prometheus exporter. Treated like a proxy task: if it fails to
     // bind, startup aborts with a non-zero exit.
     if let Some(addr) = metrics_listen {
-        tasks.spawn(metrics::serve(addr, stats.clone(), shutdown.clone()));
+        tasks.spawn(metrics::serve(
+            addr,
+            stats.clone(),
+            stop_accepting.clone(),
+        ));
     }
 
     for cfg in proxies {
@@ -58,7 +63,12 @@ async fn main() -> Result<()> {
             max_per_ip = cfg.max_per_ip,
             "resolved config"
         );
-        tasks.spawn(proxy::run(cfg, stats.clone(), shutdown.clone()));
+        tasks.spawn(proxy::run_graceful(
+            cfg,
+            stats.clone(),
+            stop_accepting.clone(),
+            force_shutdown.clone(),
+        ));
     }
 
     tokio::select! {
@@ -84,10 +94,10 @@ async fn main() -> Result<()> {
 
     let grace = Duration::from_secs(shutdown_grace);
     info!(?grace, "shutting down");
-    shutdown.cancel();
+    stop_accepting.cancel();
 
     let mut any_error = false;
-    let _ = tokio::time::timeout(grace, async {
+    let graceful = tokio::time::timeout(grace, async {
         while let Some(finished) = tasks.join_next().await {
             match finished {
                 Ok(Err(e)) => {
@@ -103,6 +113,24 @@ async fn main() -> Result<()> {
         }
     })
     .await;
+
+    if graceful.is_err() {
+        info!(?grace, "shutdown grace elapsed, force-closing active sessions");
+        force_shutdown.cancel();
+        while let Some(finished) = tasks.join_next().await {
+            match finished {
+                Ok(Err(e)) => {
+                    tracing::error!("proxy error: {e:#}");
+                    any_error = true;
+                }
+                Err(e) => {
+                    tracing::error!("proxy task panicked: {e}");
+                    any_error = true;
+                }
+                Ok(Ok(())) => {}
+            }
+        }
+    }
 
     info!("bye");
     if any_error {
