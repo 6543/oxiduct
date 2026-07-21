@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -80,12 +80,14 @@ pub async fn serve(
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::new(Mutex::new(HashMap::new()));
     // Sources with a session-setup task in flight (see PendingGuard).
     let pending: Arc<StdMutex<HashSet<SocketAddr>>> = Arc::new(StdMutex::new(HashSet::new()));
+    let cleanup_wakeup = Arc::new(Notify::new());
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
     let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
 
-    // Cleanup task: on a 5-second tick, evict sessions that died (relay task
-    // hit an error and cancelled itself) and, if enabled, idle sessions.
-    // Without this, a dead session would pin its limits slot forever.
+    // Cleanup task: sleep until the nearest idle deadline, capped at five
+    // seconds so dead relay tasks are also evicted promptly. New sessions wake
+    // it to recalculate. Without this, a dead session would pin its limits slot
+    // forever.
     {
         let sessions2 = sessions.clone();
         let idle_secs = cfg.idle_timeout_secs;
@@ -97,11 +99,36 @@ pub async fn serve(
             .connections_closed
             .with_label_values(&[cfg.name.as_str(), "error"]);
         let active2 = active.clone();
+        let wakeup = cleanup_wakeup.clone();
         tokio::spawn(async move {
             loop {
+                let wait = {
+                    let map = sessions2.lock().await;
+                    if map.values().any(|s| s.cancel.is_cancelled()) {
+                        Duration::ZERO
+                    } else if idle_secs > 0 {
+                        let now = now_ms();
+                        let idle_ms = idle_secs.saturating_mul(1000);
+                        let until_idle = map
+                            .values()
+                            .map(|s| {
+                                s.last_activity
+                                    .load(Ordering::Relaxed)
+                                    .saturating_add(idle_ms)
+                                    .saturating_sub(now)
+                            })
+                            .min()
+                            .unwrap_or(5000);
+                        Duration::from_millis(until_idle.min(5000))
+                    } else {
+                        Duration::from_secs(5)
+                    }
+                };
+
                 tokio::select! {
                     _ = shut.cancelled() => break,
-                    _ = sleep(Duration::from_secs(5)) => {}
+                    _ = wakeup.notified() => continue,
+                    _ = sleep(wait) => {}
                 }
                 let now = now_ms();
                 let mut map = sessions2.lock().await;
@@ -232,6 +259,7 @@ pub async fn serve(
                 let listen_sock = listen_sock.clone();
                 let shutdown = shutdown.clone();
                 let active = active.clone();
+                let cleanup_wakeup = cleanup_wakeup.clone();
                 tokio::spawn(async move {
                     // Cleared when this task ends, whatever the outcome.
                     let _pending = pending_guard;
@@ -262,6 +290,7 @@ pub async fn serve(
                         metrics.connections_total
                             .with_label_values(&[cfg.name.as_str(), "udp"]).inc();
                         active.set(map.len() as i64);
+                        cleanup_wakeup.notify_one();
                     }
                 });
             }
