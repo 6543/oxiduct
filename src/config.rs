@@ -26,7 +26,7 @@ pub mod defaults {
     pub const MAX_PER_IP: u32 = 320;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -235,7 +235,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig> {
         if !names.insert(p.name.as_str()) {
             anyhow::bail!("duplicate proxy name \"{}\"", p.name);
         }
-        if !listens.insert(p.listen.as_str()) {
+        if !listens.insert((p.protocol, p.listen.as_str())) {
             anyhow::bail!("duplicate listen address \"{}\"", p.listen);
         }
     }
