@@ -427,3 +427,51 @@ async fn watchdog(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_interrupts_backpressured_write() {
+        let reader = tokio::io::repeat(b'x').take(BUF_SIZE as u64);
+        let (writer, mut blocked_reader) = tokio::io::duplex(1);
+        let last_activity = Arc::new(AtomicU64::new(now_ms()));
+        let cancel = CancellationToken::new();
+        let (done_tx, _done_rx) = mpsc::channel(1);
+        let metrics = Metrics::new();
+        let bytes = metrics.bytes_total.with_label_values(&["test", "up"]);
+
+        let mut task = tokio::spawn(copy_dir(
+            1,
+            Dir::Up,
+            reader,
+            writer,
+            last_activity,
+            cancel.clone(),
+            done_tx,
+            bytes,
+        ));
+
+        // Observe the first written byte. write_all still has BUF_SIZE - 1
+        // bytes left and will block again on the one-byte output buffer.
+        let mut observed = [0u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            blocked_reader.read_exact(&mut observed),
+        )
+        .await
+        .expect("copy task never reached its writer")
+        .unwrap();
+        cancel.cancel();
+
+        let finished = tokio::time::timeout(Duration::from_millis(250), &mut task).await;
+        if finished.is_err() {
+            task.abort();
+        }
+        assert!(
+            finished.is_ok(),
+            "copy task ignored cancellation while its writer was backpressured"
+        );
+    }
+}
