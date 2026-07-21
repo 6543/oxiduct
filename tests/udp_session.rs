@@ -101,6 +101,38 @@ async fn idle_session_evicted_then_recreated() {
 }
 
 #[tokio::test]
+async fn idle_session_releases_limit_at_configured_deadline() {
+    let echo = spawn_udp_echo().await;
+    let mut cfg = cfg_udp(echo);
+    cfg.idle_timeout_secs = 1;
+    cfg.max_connections = 1;
+    let proxy = spawn_udp_proxy(cfg).await;
+
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    first.connect(proxy.addr).await.unwrap();
+    first.send(b"first").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(1), first.recv(&mut buf))
+        .await
+        .expect("first session did not receive its response")
+        .unwrap();
+    assert_eq!(&buf[..n], b"first");
+
+    wait_past(1).await;
+
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    second.connect(proxy.addr).await.unwrap();
+    second.send(b"second").await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(1), second.recv(&mut buf))
+        .await
+        .expect("idle session retained the only connection slot past its deadline")
+        .unwrap();
+    assert_eq!(&buf[..n], b"second");
+
+    proxy.stop().await;
+}
+
+#[tokio::test]
 async fn many_distinct_sources_no_panic() {
     // Open 100 UDP sockets, each sends one packet, each gets a session.
     // Verifies the session map handles many entries without panicking.
