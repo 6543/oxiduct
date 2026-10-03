@@ -167,9 +167,37 @@ impl ProxyConfig {
                 self.name
             );
         }
+        // The kernel refuses larger keepalive values (EINVAL), which would
+        // only surface as a warning on every connection while L1 stays off.
+        for (key, value, max) in [
+            (
+                "keepalive_idle",
+                self.keepalive_idle_secs,
+                MAX_KEEPALIVE_SECS,
+            ),
+            (
+                "keepalive_interval",
+                self.keepalive_interval_secs,
+                MAX_KEEPALIVE_SECS,
+            ),
+            (
+                "keepalive_retries",
+                u64::from(self.keepalive_retries),
+                MAX_KEEPALIVE_RETRIES,
+            ),
+        ] {
+            if value > max {
+                anyhow::bail!("proxy \"{}\": {key} must be at most {max}", self.name);
+            }
+        }
         Ok(())
     }
 }
+
+/// Linux upper bound for `TCP_KEEPIDLE` / `TCP_KEEPINTVL` (seconds).
+const MAX_KEEPALIVE_SECS: u64 = 32_767;
+/// Linux upper bound for `TCP_KEEPCNT`.
+const MAX_KEEPALIVE_RETRIES: u64 = 127;
 
 /// Require `host:port` shape with a non-empty host and a valid port.
 /// Returns the port so callers can add their own constraints.
@@ -682,6 +710,39 @@ mod tests {
             format!("{err:#}").contains("connect_timeout"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_keepalive() {
+        // Regression: the kernel rejects these with EINVAL, which silently
+        // left keepalive (L1) off for every connection.
+        for knob in [
+            "keepalive_idle = 32768",
+            "keepalive_interval = 32768",
+            "keepalive_retries = 128",
+        ] {
+            let key = knob.split(' ').next().unwrap();
+            let err = load_str(&format!(
+                "[[proxy]]\nlisten = \"127.0.0.1:1\"\ntarget = \"a:1\"\n{knob}\n"
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{knob}: got {err:#}");
+        }
+    }
+
+    #[test]
+    fn validate_allows_keepalive_at_kernel_maximum() {
+        load_str(
+            r#"
+            [[proxy]]
+            listen = "127.0.0.1:1"
+            target = "a:1"
+            keepalive_idle     = 32767
+            keepalive_interval = 32767
+            keepalive_retries  = 127
+            "#,
+        )
+        .unwrap();
     }
 
     #[test]

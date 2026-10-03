@@ -11,9 +11,9 @@ shutdown_grace = 10
 
 [defaults]
 connect_timeout    = 3      # seconds
-keepalive_idle     = 60     # seconds
-keepalive_interval = 10     # seconds
-keepalive_retries  = 6
+keepalive_idle     = 60     # seconds; 0 = disable keepalive; max 32767
+keepalive_interval = 10     # seconds; max 32767
+keepalive_retries  = 6      # max 127
 user_timeout_ms    = 90000  # milliseconds; Linux/Android only; 0 = OS default
 idle_timeout       = 300    # seconds; 0 = disable
 half_close_timeout = 30     # seconds; 0 = disable
