@@ -105,3 +105,47 @@ async fn dropped_proxy_handle_releases_port() {
     assert_ne!(proxy2.addr, addr, "same port reused — unlikely race");
     proxy2.stop().await;
 }
+
+#[tokio::test]
+async fn draining_listener_refuses_new_connections() {
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    let echo = spawn_tcp_echo().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop_accepting = CancellationToken::new();
+    let force_shutdown = CancellationToken::new();
+    let task = tokio::spawn(oxiduct::proxy::tcp::serve_graceful(
+        listener,
+        Arc::new(cfg_tcp(echo)),
+        oxiduct::metrics::Metrics::new(),
+        stop_accepting.clone(),
+        force_shutdown.clone(),
+    ));
+
+    // One active connection keeps the proxy in its drain phase.
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    conn.write_all(b"a").await.unwrap();
+    let mut b = [0u8; 1];
+    conn.read_exact(&mut b).await.unwrap();
+
+    stop_accepting.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A connect that succeeds here would sit in the backlog, never served.
+    let late = TcpStream::connect(addr).await;
+    assert!(
+        late.is_err(),
+        "listener still accepts connections while draining"
+    );
+
+    // The existing connection is untouched by the drain.
+    conn.write_all(b"b").await.unwrap();
+    conn.read_exact(&mut b).await.unwrap();
+    assert_eq!(&b, b"b");
+
+    force_shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+}

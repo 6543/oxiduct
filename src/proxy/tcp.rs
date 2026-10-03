@@ -166,6 +166,11 @@ pub async fn serve_graceful(
         }
     }
 
+    // Stop listening for real: while the listener is open the kernel keeps
+    // completing handshakes, so new clients would connect fine and then hang
+    // unserved until we exit. Refusing lets them fail over right away.
+    drop(listener);
+
     while let Some(finished) = connections.join_next().await {
         if let Err(e) = finished {
             warn!(proxy = %cfg.name, "TCP connection task panicked: {e}");
