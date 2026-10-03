@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +20,9 @@ use crate::clock::now_ms;
 use crate::config::ProxyConfig;
 use crate::limits::{ConnLimits, Guard};
 use crate::metrics::Metrics;
+
+/// How often a draining listener checks whether its sessions are gone.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 // ── Session ────────────────────────────────────────────────────────────────
 
@@ -175,6 +178,11 @@ pub async fn serve_graceful(
 
     let mut recv_buf = vec![0u8; 65535];
     let mut draining = false;
+    // Drain poll. Built once, outside the loop: a `sleep()` inside `select!`
+    // is recreated on every pass, so a steady stream of packets would keep
+    // resetting it and the drained check would never run.
+    let mut drain_tick = tokio::time::interval(DRAIN_POLL);
+    drain_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -197,7 +205,7 @@ pub async fn serve_graceful(
                 draining = true;
                 info!(proxy = %cfg.name, "UDP listener draining existing sessions");
             }
-            _ = sleep(Duration::from_millis(100)), if draining => {
+            _ = drain_tick.tick(), if draining => {
                 let no_sessions = sessions.lock().await.is_empty();
                 let no_pending = pending.lock().expect("pending mutex poisoned").is_empty();
                 if no_sessions && no_pending {

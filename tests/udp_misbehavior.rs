@@ -162,3 +162,45 @@ async fn dead_session_evicted_and_recreated() {
 
     proxy.stop().await;
 }
+
+/// With no sessions left a draining listener must exit promptly, even while
+/// packets from unknown sources keep arriving (those are dropped, not served).
+#[tokio::test]
+async fn drain_completes_under_incoming_packets() {
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    let echo = spawn_udp_echo().await;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap();
+    let stop_accepting = CancellationToken::new();
+    let force_shutdown = CancellationToken::new();
+    let task = tokio::spawn(oxiduct::proxy::udp::serve_graceful(
+        socket,
+        Arc::new(cfg_udp(echo)),
+        oxiduct::metrics::Metrics::new(),
+        stop_accepting.clone(),
+        force_shutdown.clone(),
+    ));
+    tokio::task::yield_now().await;
+
+    // Start draining first, so the flood below can't open a session.
+    stop_accepting.cancel();
+
+    // Packets arrive faster than the drain poll interval.
+    let flood = tokio::spawn(async move {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        loop {
+            let _ = sender.send_to(b"late", addr).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let drained = tokio::time::timeout(Duration::from_secs(2), task).await;
+    flood.abort();
+    force_shutdown.cancel();
+    assert!(
+        drained.is_ok(),
+        "drain never completed while packets kept arriving"
+    );
+}
