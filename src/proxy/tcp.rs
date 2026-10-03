@@ -393,7 +393,6 @@ async fn watchdog(
 ) -> &'static str {
     let mut up_done = false;
     let mut down_done = false;
-    let mut saw_error = false;
     let mut channel_open = true;
     let mut half_close_since: Option<u64> = None;
 
@@ -426,22 +425,23 @@ async fn watchdog(
             }
             // Disabled once the channel closes, to avoid a busy loop.
             maybe = done_rx.recv(), if channel_open => match maybe {
-                Some((Dir::Up, end)) => {
-                    up_done = true;
-                    saw_error |= end == End::Err;
+                // An error means that peer is gone for good. Unlike an EOF
+                // there is no half-open state worth a grace period, so stop
+                // the surviving direction right away.
+                Some((_, End::Err)) => {
+                    cancel.cancel();
+                    return "reset";
                 }
-                Some((Dir::Down, end)) => {
-                    down_done = true;
-                    saw_error |= end == End::Err;
-                }
+                Some((Dir::Up, End::Eof)) => up_done = true,
+                Some((Dir::Down, End::Eof)) => down_done = true,
                 None => channel_open = false,
             },
             _ = sleep(wake) => {}
         }
 
-        // Both directions finished → clean EOF, or reset if either errored.
+        // Both directions finished with a clean EOF.
         if up_done && down_done {
-            return if saw_error { "reset" } else { "eof" };
+            return "eof";
         }
 
         let now = now_ms();

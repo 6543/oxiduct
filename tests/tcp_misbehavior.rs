@@ -172,3 +172,38 @@ async fn connect_then_close_immediately_no_panic() {
 
     proxy.stop().await;
 }
+
+/// A reset is not a half-close: the peer is gone, so the proxy must drop the
+/// whole connection at once instead of parking the slot (and the upstream
+/// connection) until the half-close grace runs out.
+#[tokio::test]
+async fn client_rst_frees_slot_immediately() {
+    use socket2::SockRef;
+
+    // The upstream never closes first, and both app-level timers are off
+    // (cfg_tcp default), so only the reset itself can release the one slot.
+    let upstream = spawn_tcp_send_then_hold(b"hi").await;
+    let mut cfg = cfg_tcp(upstream);
+    cfg.max_connections = 1;
+    let proxy = spawn_tcp_proxy(cfg).await;
+
+    let mut conn = TcpStream::connect(proxy.addr).await.unwrap();
+    let mut buf = [0u8; 2];
+    conn.read_exact(&mut buf).await.unwrap();
+    SockRef::from(&conn)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(conn); // RST
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A rejected connection is closed without ever reaching the upstream.
+    let mut next = TcpStream::connect(proxy.addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), next.read_exact(&mut buf))
+        .await
+        .expect("slot still held after client reset")
+        .expect("connection rejected: slot still held after client reset");
+    assert_eq!(&buf, b"hi");
+
+    proxy.stop().await;
+}
