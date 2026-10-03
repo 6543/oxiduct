@@ -5,7 +5,7 @@
 //! keepalive and TCP_USER_TIMEOUT don't apply to UDP.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -330,27 +330,18 @@ pub async fn serve_graceful(
                         return;
                     }
 
-                    // Insert. Another packet from the same source may have
-                    // raced us to create a session while we were resolving; if
-                    // so, keep the existing one (unless it already died) and
-                    // drop ours (its Guard releases).
+                    // Insert. No session for this source can be in the map:
+                    // the listener only gets here when it found none (or just
+                    // evicted a dead one), and the pending mark keeps a second
+                    // setup task for the same source from running until this
+                    // one is done.
+                    let _ = session.tx.try_send(data);
                     let mut map = sessions.lock().await;
-                    if let Some(existing) = map.get(&src).filter(|s| !s.cancel.is_cancelled()) {
-                        existing.last_activity.store(now_ms(), Ordering::Relaxed);
-                        let _ = existing.tx.try_send(data);
-                        session.cancel.cancel(); // tear down the loser's relay tasks
-                    } else {
-                        let _ = session.tx.try_send(data);
-                        if map.insert(src, session).is_some() {
-                            // Replaced a session that died while we were resolving.
-                            metrics.connections_closed
-                                .with_label_values(&[cfg.name.as_str(), "error"]).inc();
-                        }
-                        metrics.connections_total
-                            .with_label_values(&[cfg.name.as_str(), "udp"]).inc();
-                        active.set(map.len() as i64);
-                        cleanup_wakeup.notify_one();
-                    }
+                    map.insert(src, session);
+                    metrics.connections_total
+                        .with_label_values(&[cfg.name.as_str(), "udp"]).inc();
+                    active.set(map.len() as i64);
+                    cleanup_wakeup.notify_one();
                 });
             }
         }
@@ -384,9 +375,9 @@ async fn open_session(
                 .ok_or_else(|| anyhow::anyhow!("no address resolved for {}", cfg.target))?;
 
             let bind_addr: SocketAddr = if target_addr.is_ipv6() {
-                "[::]:0".parse().unwrap()
+                (Ipv6Addr::UNSPECIFIED, 0).into()
             } else {
-                "0.0.0.0:0".parse().unwrap()
+                (Ipv4Addr::UNSPECIFIED, 0).into()
             };
 
             let upstream = UdpSocket::bind(bind_addr)
@@ -416,7 +407,6 @@ async fn open_session(
         let la = last_activity.clone();
         let c = cancel.clone();
         let s = shutdown.clone();
-        let bytes_up = bytes_up.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -449,8 +439,7 @@ async fn open_session(
     {
         let la = last_activity.clone();
         let c = cancel.clone();
-        let s = shutdown.clone();
-        let bytes_down = bytes_down.clone();
+        let s = shutdown;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
