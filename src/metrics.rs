@@ -202,29 +202,20 @@ async fn handle_request(mut stream: tokio::net::TcpStream, metrics: &Metrics) ->
         method == "GET" && (path == "/metrics" || path.starts_with("/metrics?"))
     };
 
-    if is_metrics {
-        let body = metrics.render();
-        let header = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain; version=0.0.4\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(header.as_bytes()).await?;
-        stream.write_all(&body).await?;
+    let (status, content_type, body) = if is_metrics {
+        ("200 OK", "text/plain; version=0.0.4", metrics.render())
     } else {
-        let body = b"404 not found\n";
-        let header = format!(
-            "HTTP/1.1 404 Not Found\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(header.as_bytes()).await?;
-        stream.write_all(body).await?;
-    }
+        ("404 Not Found", "text/plain", b"404 not found\n".to_vec())
+    };
+    let header = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&body).await?;
     stream.flush().await?;
 
     // Close gracefully: signal EOF, then briefly drain whatever the client
