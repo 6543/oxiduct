@@ -16,8 +16,15 @@ use crate::config::defaults;
         .args(["config", "listen"]),
 ))]
 pub struct Args {
-    /// TOML config file (multi-proxy mode; conflicts with --listen / --target)
-    #[arg(short, long, conflicts_with_all = ["listen", "target", "protocol"])]
+    /// TOML config file (multi-proxy mode; conflicts with --listen / --target
+    /// and every per-proxy tuning flag, which belong in the file instead)
+    #[arg(short, long, conflicts_with_all = [
+        "listen", "target", "protocol",
+        "connect_timeout", "keepalive_idle", "keepalive_interval",
+        "keepalive_retries", "user_timeout_ms", "idle_timeout",
+        "half_close_timeout", "max_connections", "max_per_ip",
+        "proxy_protocol",
+    ])]
     pub config: Option<PathBuf>,
 
     /// Listen address: "host:port" or bare "port" (expands to 0.0.0.0:PORT)
@@ -102,7 +109,49 @@ pub fn expand_listen(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_listen;
+    use super::{expand_listen, Args};
+    use clap::Parser;
+
+    #[test]
+    fn config_rejects_per_proxy_tuning_flags() {
+        // These would otherwise be parsed and then silently ignored, since
+        // config mode takes every knob from the file.
+        for flag in [
+            &["--connect-timeout", "1"][..],
+            &["--keepalive-idle", "1"],
+            &["--keepalive-interval", "1"],
+            &["--keepalive-retries", "1"],
+            &["--user-timeout-ms", "1"],
+            &["--idle-timeout", "1"],
+            &["--half-close-timeout", "1"],
+            &["--max-connections", "1"],
+            &["--max-per-ip", "1"],
+            &["--proxy-protocol"],
+        ] {
+            let argv = ["oxiduct", "--config", "c.toml"].iter().chain(flag);
+            assert!(
+                Args::try_parse_from(argv).is_err(),
+                "{flag:?} must conflict with --config"
+            );
+        }
+    }
+
+    #[test]
+    fn config_allows_global_flags() {
+        let args = Args::try_parse_from([
+            "oxiduct",
+            "--config",
+            "c.toml",
+            "--shutdown-grace",
+            "5",
+            "--metrics-listen",
+            "127.0.0.1:9090",
+            "--log-level",
+            "debug",
+        ])
+        .unwrap();
+        assert_eq!(args.shutdown_grace, Some(5));
+    }
 
     #[test]
     fn expand_bare_port() {

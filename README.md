@@ -110,7 +110,7 @@ See [`contrib/example.toml`](contrib/example.toml) for all available options wit
 | `--listen` | (required) | Address or port to listen on |
 | `--target` | (required) | Upstream host:port to forward to |
 | `--protocol` | `tcp` | `tcp` or `udp` |
-| `--config` | | Load from TOML config instead of flags |
+| `--config` | | Load from TOML config instead of flags (only `--shutdown-grace`, `--metrics-listen` and `--log-level` may be combined with it) |
 | `--connect-timeout` | 3s | How long to wait for upstream to connect |
 | `--idle-timeout` | 300s | Close connection if silent this long (0 = off) |
 | `--half-close-timeout` | 30s | Grace period after one side closes (0 = off) |
