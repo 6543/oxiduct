@@ -93,22 +93,7 @@ async fn main() -> Result<()> {
     stop_accepting.cancel();
 
     let mut any_error = false;
-    let graceful = tokio::time::timeout(grace, async {
-        while let Some(finished) = tasks.join_next().await {
-            match finished {
-                Ok(Err(e)) => {
-                    tracing::error!("proxy error: {e:#}");
-                    any_error = true;
-                }
-                Err(e) => {
-                    tracing::error!("proxy task panicked: {e}");
-                    any_error = true;
-                }
-                Ok(Ok(())) => {}
-            }
-        }
-    })
-    .await;
+    let graceful = tokio::time::timeout(grace, drain(&mut tasks, &mut any_error)).await;
 
     if graceful.is_err() {
         info!(
@@ -116,19 +101,7 @@ async fn main() -> Result<()> {
             "shutdown grace elapsed, force-closing active sessions"
         );
         force_shutdown.cancel();
-        while let Some(finished) = tasks.join_next().await {
-            match finished {
-                Ok(Err(e)) => {
-                    tracing::error!("proxy error: {e:#}");
-                    any_error = true;
-                }
-                Err(e) => {
-                    tracing::error!("proxy task panicked: {e}");
-                    any_error = true;
-                }
-                Ok(Ok(())) => {}
-            }
-        }
+        drain(&mut tasks, &mut any_error).await;
     }
 
     info!("bye");
@@ -136,6 +109,25 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Wait for every remaining task, logging failures and noting them in
+/// `any_error` (a flag rather than a return value, so failures seen before a
+/// timeout cancels this future are not lost).
+async fn drain(tasks: &mut JoinSet<Result<()>>, any_error: &mut bool) {
+    while let Some(finished) = tasks.join_next().await {
+        match finished {
+            Ok(Err(e)) => {
+                tracing::error!("proxy error: {e:#}");
+                *any_error = true;
+            }
+            Err(e) => {
+                tracing::error!("proxy task panicked: {e}");
+                *any_error = true;
+            }
+            Ok(Ok(())) => {}
+        }
+    }
 }
 
 #[cfg(unix)]
