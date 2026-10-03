@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 use crate::config::defaults;
 
@@ -93,8 +95,28 @@ pub struct Args {
     pub metrics_listen: Option<String>,
 
     /// Log level — also read from RUST_LOG env var
-    #[arg(long, default_value = "info", env = "RUST_LOG")]
+    #[arg(long, default_value = "info", env = "RUST_LOG", value_parser = parse_log_level)]
     pub log_level: String,
+}
+
+/// Validate a `--log-level` / `RUST_LOG` value up front.
+///
+/// `EnvFilter` reads a bare word it doesn't know as a *target* name, so a
+/// typo like `verbose` would be accepted and then match nothing, leaving the
+/// proxy completely silent. Require bare words to be real levels; scoping a
+/// level to one target stays available as `target=level`.
+fn parse_log_level(s: &str) -> Result<String, String> {
+    for directive in s.split(',').filter(|d| !d.is_empty()) {
+        if !directive.contains('=') && directive.parse::<LevelFilter>().is_err() {
+            return Err(format!(
+                "unknown log level \"{directive}\" (expected trace, debug, info, warn, \
+                 error, off, or target=level)"
+            ));
+        }
+    }
+    EnvFilter::try_new(s)
+        .map(|_| s.to_owned())
+        .map_err(|e| e.to_string())
 }
 
 /// Expand a bare port number "587" to "0.0.0.0:587". Anything that doesn't
@@ -109,8 +131,29 @@ pub fn expand_listen(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_listen, Args};
+    use super::{expand_listen, parse_log_level, Args};
     use clap::Parser;
+
+    #[test]
+    fn log_level_accepts_levels_and_scoped_directives() {
+        for ok in [
+            "info",
+            "DEBUG",
+            "off",
+            "warn,oxiduct=trace",
+            "oxiduct::proxy=debug",
+        ] {
+            assert_eq!(parse_log_level(ok).as_deref(), Ok(ok));
+        }
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_bare_words() {
+        // Regression: these used to parse as target names and mute all logs.
+        for bad in ["verbose", "infoo", "info,bogus"] {
+            assert!(parse_log_level(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
 
     #[test]
     fn config_rejects_per_proxy_tuning_flags() {

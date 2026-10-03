@@ -119,7 +119,7 @@ See [`contrib/example.toml`](contrib/example.toml) for all available options wit
 | `--shutdown-grace` | 10s | Time to finish active connections on SIGTERM |
 | `--metrics-listen` | (off) | Expose Prometheus metrics at this address |
 | `--proxy-protocol` | off | Prepend a PROXY protocol v2 header upstream so the target sees the real client (TCP only) |
-| `--log-level` | `info` | Log verbosity (`trace`/`debug`/`info`/`warn`/`error`) |
+| `--log-level` | `info` | Log verbosity (`trace`/`debug`/`info`/`warn`/`error`/`off`, or per-target `target=level`); also read from `RUST_LOG` |
 | `--keepalive-idle` | 60s | TCP keepalive idle time |
 | `--keepalive-interval` | 10s | TCP keepalive probe interval |
 | `--keepalive-retries` | 6 | TCP keepalive max probes |
