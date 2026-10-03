@@ -396,32 +396,55 @@ async fn watchdog(
     idle_secs: u64,
     half_close_secs: u64,
 ) -> &'static str {
+    let idle_ms = idle_secs.saturating_mul(1000);
+    let half_close_ms = half_close_secs.saturating_mul(1000);
     let mut up_done = false;
     let mut down_done = false;
     let mut channel_open = true;
     let mut half_close_since: Option<u64> = None;
 
     loop {
-        // Sleep only as long as the nearest deadline needs, capped at
-        // WATCHDOG_TICK. This keeps small idle/half-close timeouts accurate
-        // instead of rounding up to a fixed tick.
+        // Both directions finished with a clean EOF.
+        if up_done && down_done {
+            return "eof";
+        }
+
+        // Check each deadline and, while at it, sleep only as long as the
+        // nearest one needs (capped at WATCHDOG_TICK), so small timeouts stay
+        // accurate instead of rounding up to a fixed tick.
         let now = now_ms();
+        let last = last_activity.load(Ordering::Relaxed);
         let mut wake_ms = WATCHDOG_TICK.as_millis() as u64;
+
+        // L3: application-level idle timeout.
         if idle_secs > 0 {
-            let deadline = last_activity
-                .load(Ordering::Relaxed)
-                .saturating_add(idle_secs.saturating_mul(1000));
-            wake_ms = wake_ms.min(deadline.saturating_sub(now));
-        }
-        if half_close_secs > 0 {
-            if let Some(since) = half_close_since {
-                let base = since.max(last_activity.load(Ordering::Relaxed));
-                let deadline = base.saturating_add(half_close_secs.saturating_mul(1000));
-                wake_ms = wake_ms.min(deadline.saturating_sub(now));
+            let left = last.saturating_add(idle_ms).saturating_sub(now);
+            if left == 0 {
+                cancel.cancel();
+                return "idle_timeout";
             }
+            wake_ms = wake_ms.min(left);
         }
-        // Floor to avoid a busy spin when a deadline is essentially now.
-        let wake = Duration::from_millis(wake_ms.max(20));
+
+        // L4: half-close grace period. Directions never "un-finish", so the
+        // grace is armed once, on the first finished direction. The deadline
+        // is measured from the *last activity* (or the arm time, whichever is
+        // later), so a surviving direction that is still moving data — e.g. a
+        // client that sent its request, shut down its write side and is now
+        // downloading a large response — is never killed mid-transfer. Only a
+        // half-open connection that also went silent for the grace period is.
+        if half_close_secs > 0 && (up_done || down_done) {
+            let since = *half_close_since.get_or_insert(now);
+            let left = since
+                .max(last)
+                .saturating_add(half_close_ms)
+                .saturating_sub(now);
+            if left == 0 {
+                cancel.cancel();
+                return "half_close_timeout";
+            }
+            wake_ms = wake_ms.min(left);
+        }
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -441,39 +464,8 @@ async fn watchdog(
                 Some((Dir::Down, End::Eof)) => down_done = true,
                 None => channel_open = false,
             },
-            _ = sleep(wake) => {}
-        }
-
-        // Both directions finished with a clean EOF.
-        if up_done && down_done {
-            return "eof";
-        }
-
-        let now = now_ms();
-
-        // L3: application-level idle timeout.
-        if idle_secs > 0 {
-            let idle_ms = now.saturating_sub(last_activity.load(Ordering::Relaxed));
-            if idle_ms >= idle_secs.saturating_mul(1000) {
-                cancel.cancel();
-                return "idle_timeout";
-            }
-        }
-
-        // L4: half-close grace period. Directions never "un-finish", so the
-        // grace is armed once, on the first finished direction. The deadline
-        // is measured from the *last activity* (or the arm time, whichever is
-        // later), so a surviving direction that is still moving data — e.g. a
-        // client that sent its request, shut down its write side and is now
-        // downloading a large response — is never killed mid-transfer. Only a
-        // half-open connection that also went silent for the grace period is.
-        if half_close_secs > 0 && (up_done || down_done) {
-            let since = *half_close_since.get_or_insert(now);
-            let base = since.max(last_activity.load(Ordering::Relaxed));
-            if now.saturating_sub(base) >= half_close_secs.saturating_mul(1000) {
-                cancel.cancel();
-                return "half_close_timeout";
-            }
+            // Floor to avoid a busy spin when a deadline is a few ms away.
+            _ = sleep(Duration::from_millis(wake_ms.max(20))) => {}
         }
     }
 }
