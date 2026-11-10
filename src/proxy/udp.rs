@@ -367,108 +367,38 @@ async fn open_session(
         biased;
         _ = shutdown.cancelled() => anyhow::bail!("UDP session setup cancelled"),
         result = tokio::time::timeout(Duration::from_secs(cfg.connect_timeout_secs), async {
-            // Resolve target to know which IP family to bind the upstream socket to
-            let target_addr = tokio::net::lookup_host(&cfg.target)
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.target)
                 .await
                 .with_context(|| format!("DNS lookup {}", cfg.target))?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no address resolved for {}", cfg.target))?;
-
-            let bind_addr: SocketAddr = if target_addr.is_ipv6() {
-                (Ipv6Addr::UNSPECIFIED, 0).into()
-            } else {
-                (Ipv4Addr::UNSPECIFIED, 0).into()
-            };
-
-            let upstream = UdpSocket::bind(bind_addr)
+                .collect();
+            Upstream::connect(addrs)
                 .await
-                .context("UDP upstream bind")?;
-            upstream.connect(target_addr).await.context("UDP connect")?;
-            Ok::<_, anyhow::Error>(Arc::new(upstream))
+                .with_context(|| format!("UDP connect {}", cfg.target))
         }) => result.context("UDP session setup timed out")??,
     };
 
     info!(%src, target = %cfg.target, "UDP session opened");
 
     let last_activity = Arc::new(AtomicU64::new(now_ms()));
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
     let cancel = CancellationToken::new();
 
-    let bytes_up = metrics
-        .bytes_total
-        .with_label_values(&[cfg.name.as_str(), "up"]);
-    let bytes_down = metrics
-        .bytes_total
-        .with_label_values(&[cfg.name.as_str(), "down"]);
-
-    // ── client → upstream ─────────────────────────────────────────────────
-    {
-        let up = upstream.clone();
-        let la = last_activity.clone();
-        let c = cancel.clone();
-        let s = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = s.cancelled() => break,
-                    _ = c.cancelled() => break,
-                    data = rx.recv() => match data {
-                        None => break,
-                        Some(d) => {
-                            la.store(now_ms(), Ordering::Relaxed);
-                            match up.send(&d).await {
-                                Ok(n) => bytes_up.inc_by(n as u64),
-                                Err(e) => {
-                                    debug!(%src, "UDP send upstream: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Mark the whole session dead so the partner task stops and the
-            // listener evicts (and can transparently re-create) the session.
-            c.cancel();
-            debug!(%src, "UDP client→upstream task ended");
-        });
-    }
-
-    // ── upstream → client ─────────────────────────────────────────────────
-    {
-        let la = last_activity.clone();
-        let c = cancel.clone();
-        let s = shutdown;
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = s.cancelled() => break,
-                    _ = c.cancelled() => break,
-                    res = upstream.recv(&mut buf) => match res {
-                        Err(e) => {
-                            debug!(%src, "UDP recv upstream: {e}");
-                            break;
-                        }
-                        Ok(n) => {
-                            la.store(now_ms(), Ordering::Relaxed);
-                            match listen.send_to(&buf[..n], src).await {
-                                Ok(sent) => bytes_down.inc_by(sent as u64),
-                                Err(e) => {
-                                    debug!(%src, "UDP send client: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            c.cancel();
-            debug!(%src, "UDP upstream→client task ended");
-        });
-    }
+    let relay = Relay {
+        src,
+        upstream,
+        rx,
+        listen,
+        last_activity: last_activity.clone(),
+        cancel: cancel.clone(),
+        shutdown,
+        bytes_up: metrics
+            .bytes_total
+            .with_label_values(&[cfg.name.as_str(), "up"]),
+        bytes_down: metrics
+            .bytes_total
+            .with_label_values(&[cfg.name.as_str(), "down"]),
+    };
+    tokio::spawn(relay.run());
 
     Ok(Session {
         tx,
@@ -476,4 +406,250 @@ async fn open_session(
         cancel,
         _slot: slot,
     })
+}
+
+/// The upstream side of a session.
+///
+/// A target name can resolve to several addresses (typically IPv6 and IPv4).
+/// Like a TCP connect, try them in order: when the current address refuses
+/// (ICMP port unreachable shows up as ECONNREFUSED on a connected UDP
+/// socket), move on to the next one.
+struct Upstream {
+    addrs: Vec<SocketAddr>,
+    /// Index into `addrs` of the address `sock` is connected to.
+    current: usize,
+    sock: UdpSocket,
+}
+
+impl Upstream {
+    async fn connect(addrs: Vec<SocketAddr>) -> Result<Self> {
+        let mut last_err = anyhow::anyhow!("no address resolved");
+        for (current, addr) in addrs.iter().enumerate() {
+            match socket_to(*addr).await {
+                Ok(sock) => {
+                    return Ok(Self {
+                        addrs,
+                        current,
+                        sock,
+                    })
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addrs[self.current]
+    }
+
+    /// Switch to the next address that takes a socket. `false` once all
+    /// addresses are used up.
+    async fn try_next(&mut self) -> bool {
+        while self.current + 1 < self.addrs.len() {
+            self.current += 1;
+            match socket_to(self.addr()).await {
+                Ok(sock) => {
+                    self.sock = sock;
+                    return true;
+                }
+                Err(e) => debug!(addr = %self.addr(), "UDP upstream unusable: {e:#}"),
+            }
+        }
+        false
+    }
+}
+
+/// An ephemeral UDP socket of the target's address family, connected to it.
+async fn socket_to(addr: SocketAddr) -> Result<UdpSocket> {
+    let bind_addr: SocketAddr = if addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = UdpSocket::bind(bind_addr)
+        .await
+        .context("UDP upstream bind")?;
+    sock.connect(addr).await.context("UDP connect")?;
+    Ok(sock)
+}
+
+fn is_refused(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::ConnectionRefused
+}
+
+/// Moves datagrams between one client and its upstream until the session
+/// ends. One task for both directions, so a switch to the next upstream
+/// address cannot race with a send or receive on the old socket.
+struct Relay {
+    src: SocketAddr,
+    upstream: Upstream,
+    rx: mpsc::Receiver<Vec<u8>>,
+    listen: Arc<UdpSocket>,
+    last_activity: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    shutdown: CancellationToken,
+    bytes_up: prometheus::IntCounter,
+    bytes_down: prometheus::IntCounter,
+}
+
+impl Relay {
+    async fn run(mut self) {
+        let src = self.src;
+        let mut buf = vec![0u8; 65535];
+        // The last datagram sent upstream, repeated after a switch to the
+        // next address: its refusal is what triggered the switch.
+        let mut last_sent: Option<Vec<u8>> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => break,
+                _ = self.cancel.cancelled() => break,
+                data = self.rx.recv() => match data {
+                    None => break,
+                    Some(d) => {
+                        self.last_activity.store(now_ms(), Ordering::Relaxed);
+                        if !self.send_upstream(&d).await {
+                            break;
+                        }
+                        last_sent = Some(d);
+                    }
+                },
+                res = self.upstream.sock.recv(&mut buf) => match res {
+                    Err(e) if is_refused(&e) && self.next_upstream().await => {
+                        if let Some(d) = &last_sent {
+                            if !self.send_upstream(d).await {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(%src, "UDP recv upstream: {e}");
+                        break;
+                    }
+                    Ok(n) => {
+                        self.last_activity.store(now_ms(), Ordering::Relaxed);
+                        match self.listen.send_to(&buf[..n], src).await {
+                            Ok(sent) => self.bytes_down.inc_by(sent as u64),
+                            Err(e) => {
+                                debug!(%src, "UDP send client: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Mark the whole session dead so the listener evicts (and can
+        // transparently re-create) it.
+        self.cancel.cancel();
+        debug!(%src, "UDP relay task ended");
+    }
+
+    /// Send one datagram upstream; `false` ends the session.
+    async fn send_upstream(&mut self, d: &[u8]) -> bool {
+        loop {
+            match self.upstream.sock.send(d).await {
+                Ok(n) => {
+                    self.bytes_up.inc_by(n as u64);
+                    return true;
+                }
+                // A refusal of an earlier datagram can surface on this send.
+                Err(e) if is_refused(&e) && self.next_upstream().await => continue,
+                Err(e) => {
+                    debug!(src = %self.src, "UDP send upstream: {e}");
+                    return false;
+                }
+            }
+        }
+    }
+
+    async fn next_upstream(&mut self) -> bool {
+        let refused = self.upstream.addr();
+        if !self.upstream.try_next().await {
+            return false;
+        }
+        info!(
+            src = %self.src,
+            %refused,
+            next = %self.upstream.addr(),
+            "UDP target refused, trying the next address"
+        );
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UDP echo on 127.0.0.1, echoes every datagram back to its sender.
+    async fn echo() -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let _ = sock.send_to(&buf[..n], peer).await;
+            }
+        });
+        addr
+    }
+
+    /// A local UDP port nobody listens on, so datagrams to it get refused.
+    fn closed_port() -> SocketAddr {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.local_addr().unwrap()
+    }
+
+    /// Relay one datagram from a client through a session whose target
+    /// resolved to `addrs`, and return the reply the client got.
+    async fn round_trip(addrs: Vec<SocketAddr>) -> Option<Vec<u8>> {
+        let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(listen.local_addr().unwrap()).await.unwrap();
+
+        let metrics = Metrics::new();
+        let (tx, rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let relay = Relay {
+            src: client.local_addr().unwrap(),
+            upstream: Upstream::connect(addrs).await.unwrap(),
+            rx,
+            listen,
+            last_activity: Arc::new(AtomicU64::new(now_ms())),
+            cancel: cancel.clone(),
+            shutdown: CancellationToken::new(),
+            bytes_up: metrics.bytes_total.with_label_values(&["test", "up"]),
+            bytes_down: metrics.bytes_total.with_label_values(&["test", "down"]),
+        };
+        tokio::spawn(relay.run());
+
+        tx.send(b"ping".to_vec()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let reply = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await;
+        cancel.cancel();
+        match reply {
+            Ok(Ok(n)) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn relays_to_the_first_address() {
+        let reply = round_trip(vec![echo().await]).await;
+        assert_eq!(reply.as_deref(), Some(&b"ping"[..]));
+    }
+
+    #[tokio::test]
+    async fn moves_on_when_an_address_refuses() {
+        let reply = round_trip(vec![closed_port(), echo().await]).await;
+        assert_eq!(reply.as_deref(), Some(&b"ping"[..]));
+    }
+
+    #[tokio::test]
+    async fn ends_the_session_when_every_address_refuses() {
+        let reply = round_trip(vec![closed_port(), closed_port()]).await;
+        assert_eq!(reply, None);
+    }
 }
