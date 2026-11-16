@@ -3,6 +3,7 @@
 //! Two layers, both per-proxy:
 //!   * total cap        — protects the host (FDs, memory, scheduler).
 //!   * per-source-IP cap — makes a basic flooding DOS less convenient.
+//!     An IPv6 source counts by its /64, the smallest block a host gets.
 //!
 //! Behaviour:
 //!   * On the first crossing of 90 % of either limit, emit a single `warn!`
@@ -13,7 +14,7 @@
 //!     drops, so RAII handles cleanup even on panic / cancellation.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 
 use tracing::warn;
@@ -85,6 +86,7 @@ impl ConnLimits {
     ///
     /// `max_total == 0` or `max_per_ip == 0` disables that specific layer.
     pub fn try_acquire(self: &Arc<Self>, src_ip: IpAddr) -> Result<Guard, Reject> {
+        let src_ip = per_ip_key(src_ip);
         let mut s = self.state.lock().expect("limits mutex poisoned");
 
         if self.max_total > 0 && s.total >= self.max_total {
@@ -150,7 +152,7 @@ impl ConnLimits {
             .lock()
             .unwrap()
             .per_ip
-            .get(&ip)
+            .get(&per_ip_key(ip))
             .map(|s| s.count)
             .unwrap_or(0)
     }
@@ -166,6 +168,15 @@ impl Drop for Guard {
                 s.per_ip.remove(&self.src_ip);
             }
         }
+    }
+}
+
+/// What the per-IP cap counts a source as: an IPv6 address by its /64, since
+/// one host can use every address in it. IPv4 (also IPv4-mapped) stays as is.
+fn per_ip_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Ipv6Addr::from_bits(v6.to_bits() & !(u64::MAX as u128)).into(),
+        v4 => v4,
     }
 }
 
@@ -208,6 +219,27 @@ mod tests {
         assert_eq!(l.try_acquire(ip("10.0.0.1")).err(), Some(Reject::PerIp));
         // A different IP is still admitted.
         let _g3 = l.try_acquire(ip("10.0.0.2")).unwrap();
+    }
+
+    #[test]
+    fn per_ip_cap_counts_an_ipv6_slash_64_as_one_source() {
+        let l = ConnLimits::new(0, 2);
+        let _g1 = l.try_acquire(ip("2001:db8:0:1::1")).unwrap();
+        let _g2 = l.try_acquire(ip("2001:db8:0:1:ffff::2")).unwrap();
+        assert_eq!(
+            l.try_acquire(ip("2001:db8:0:1::3")).err(),
+            Some(Reject::PerIp)
+        );
+        // The next /64 is a different source.
+        let _g3 = l.try_acquire(ip("2001:db8:0:2::1")).unwrap();
+    }
+
+    #[test]
+    fn per_ip_cap_counts_ipv4_mapped_as_ipv4() {
+        let l = ConnLimits::new(0, 1);
+        let _g1 = l.try_acquire(ip("::ffff:10.0.0.1")).unwrap();
+        assert_eq!(l.try_acquire(ip("10.0.0.1")).err(), Some(Reject::PerIp));
+        let _g2 = l.try_acquire(ip("::ffff:10.0.0.2")).unwrap();
     }
 
     #[test]

@@ -115,7 +115,7 @@ See [`contrib/example.toml`](contrib/example.toml) for all available options wit
 | `--idle-timeout` | 300s | Close connection if silent this long (0 = off) |
 | `--half-close-timeout` | 30s | Grace period after one side closes (0 = off) |
 | `--max-connections` | 32000 | Max simultaneous connections (0 = unlimited) |
-| `--max-per-ip` | 320 | Max connections per source IP (0 = unlimited) |
+| `--max-per-ip` | 320 | Max connections per source IP, an IPv6 /64 counts as one (0 = unlimited) |
 | `--shutdown-grace` | 10s | Time to finish active connections on SIGTERM |
 | `--metrics-listen` | (off) | Expose Prometheus metrics at this address |
 | `--proxy-protocol` | off | Prepend a PROXY protocol v2 header upstream so the target sees the real client (TCP only) |
