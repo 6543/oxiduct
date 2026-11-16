@@ -161,7 +161,7 @@ Available metrics (all labelled by `proxy`):
 
 Throughput in Prometheus: `rate(oxiduct_bytes_total[1m])`
 
-Close reasons: `eof` / `reset` / `idle_timeout` / `half_close_timeout` / `shutdown`
+Close reasons: `eof` / `reset` / `idle_timeout` / `half_close_timeout` / `shutdown` / `error` (UDP session lost its target)
 
 ---
 
