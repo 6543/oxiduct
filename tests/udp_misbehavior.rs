@@ -138,10 +138,12 @@ async fn dead_session_evicted_and_recreated() {
 
     // Each send may hit a live-but-doomed or an already-dead session; either
     // way no send may ever be rejected by the limiter.
-    for _ in 0..5 {
+    let start = std::time::Instant::now();
+    for _ in 0..9 {
         client.send(b"ping").await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    let elapsed_secs = start.elapsed().as_secs();
 
     let rejected: u64 = ["total", "per_ip"]
         .iter()
@@ -160,6 +162,12 @@ async fn dead_session_evicted_and_recreated() {
         .with_label_values(&["test", "udp"])
         .get();
     assert!(opened >= 2, "expected session re-creation, got {opened}");
+    // But a target that stays down gets one retry per second, not one new
+    // session per packet.
+    assert!(
+        opened <= elapsed_secs + 2,
+        "{opened} sessions opened in {elapsed_secs}s"
+    );
 
     proxy.stop().await;
 }

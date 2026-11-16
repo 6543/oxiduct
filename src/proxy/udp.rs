@@ -25,6 +25,9 @@ use crate::metrics::Metrics;
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 /// Longest sleep of the session cleanup task between two checks.
 const CLEANUP_TICK_MS: u64 = 5000;
+/// How long a dead session blocks a retry, so a target that stays down costs
+/// one new session per second and not one per packet.
+const DEAD_RETRY_MS: u64 = 1000;
 
 // ── Session ────────────────────────────────────────────────────────────────
 
@@ -39,19 +42,21 @@ struct Session {
 }
 
 impl Session {
-    /// Milliseconds until the cleanup task must evict this session: 0 once
-    /// its relay is dead or it sat idle for `idle_ms` (0 = no idle timeout).
+    /// Milliseconds until this session is due for eviction: `DEAD_RETRY_MS`
+    /// after its last traffic once the relay is dead, else `idle_ms` after it
+    /// (0 = no idle timeout).
     fn evict_in_ms(&self, idle_ms: u64, now: u64) -> u64 {
-        if self.cancel.is_cancelled() {
-            0
+        let keep_ms = if self.cancel.is_cancelled() {
+            DEAD_RETRY_MS
         } else if idle_ms == 0 {
-            u64::MAX
+            return u64::MAX;
         } else {
-            self.last_activity
-                .load(Ordering::Relaxed)
-                .saturating_add(idle_ms)
-                .saturating_sub(now)
-        }
+            idle_ms
+        };
+        self.last_activity
+            .load(Ordering::Relaxed)
+            .saturating_add(keep_ms)
+            .saturating_sub(now)
     }
 }
 
@@ -108,13 +113,13 @@ pub async fn serve_graceful(
     let cleanup_shutdown = force_shutdown.child_token();
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
     let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
+    let idle_ms = cfg.idle_timeout_secs.saturating_mul(1000);
 
     // Cleanup task: sleep until the next session is due, at most one tick.
     // New sessions wake it to recalculate. Without this, a dead session would
     // pin its limits slot forever.
     {
         let sessions = sessions.clone();
-        let idle_ms = cfg.idle_timeout_secs.saturating_mul(1000);
         let shut = cleanup_shutdown.clone();
         let closed_idle = metrics
             .connections_closed
@@ -215,12 +220,16 @@ pub async fn serve_graceful(
 
                 // Fast path: existing session. Short critical section only.
                 // A dead session (relay task errored and cancelled itself) is
-                // evicted right here so this packet re-creates it below,
-                // instead of being dropped until the cleanup tick fires.
+                // evicted right here once it is due, so this packet re-creates
+                // it below instead of waiting for the cleanup tick.
                 {
                     let mut map = sessions.lock().await;
                     match map.get(&src) {
                         Some(session) if session.cancel.is_cancelled() => {
+                            if session.evict_in_ms(idle_ms, now_ms()) > 0 {
+                                debug!(%src, "UDP session dead, packet dropped");
+                                continue;
+                            }
                             debug!(%src, "UDP session dead, re-creating");
                             map.remove(&src);
                             metrics.connections_closed
