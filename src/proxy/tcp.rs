@@ -140,6 +140,11 @@ pub async fn serve_graceful(
                         handle(id, stream, peer, cfg, metrics, token).await
                     });
                 }
+                // The client gave up before we accepted it. Nothing is wrong
+                // with the listener, so don't make the others wait.
+                Err(e) if is_connection_error(&e) => {
+                    debug!(proxy = %cfg.name, "accept: {e}");
+                }
                 // Non-fatal (e.g. EMFILE under fd pressure), but back off
                 // briefly so a persistent error can't spin this loop hot.
                 Err(e) => {
@@ -161,6 +166,16 @@ pub async fn serve_graceful(
         }
     }
     Ok(())
+}
+
+/// accept() errors that are about the one connection, not the listener.
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
 }
 
 // ── Per-connection handler ───────────────────────────────────────────────────
