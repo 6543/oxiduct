@@ -39,11 +39,22 @@
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         bin = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+
+        # Cross build for Windows (x86_64-pc-windows-gnu): nix build .#windows
+        pkgsWindows = import nixpkgs {
+          localSystem = system;
+          crossSystem = {
+            config = "x86_64-w64-mingw32";
+            libc = "msvcrt";
+          };
+        };
+        windows = (crane.mkLib pkgsWindows).buildPackage (commonArgs // { strictDeps = true; });
       in
       with pkgs;
       {
         packages = {
           default = bin;
+          inherit windows;
         };
 
         devShells.default = mkShell {
