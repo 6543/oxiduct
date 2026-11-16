@@ -23,6 +23,8 @@ use crate::metrics::Metrics;
 
 /// How often a draining listener checks whether its sessions are gone.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
+/// Longest sleep of the session cleanup task between two checks.
+const CLEANUP_TICK_MS: u64 = 5000;
 
 // ── Session ────────────────────────────────────────────────────────────────
 
@@ -34,6 +36,23 @@ struct Session {
     cancel: CancellationToken,
     /// Holds the limits slot for the duration of this session.
     _slot: Guard,
+}
+
+impl Session {
+    /// Milliseconds until the cleanup task must evict this session: 0 once
+    /// its relay is dead or it sat idle for `idle_ms` (0 = no idle timeout).
+    fn evict_in_ms(&self, idle_ms: u64, now: u64) -> u64 {
+        if self.cancel.is_cancelled() {
+            0
+        } else if idle_ms == 0 {
+            u64::MAX
+        } else {
+            self.last_activity
+                .load(Ordering::Relaxed)
+                .saturating_add(idle_ms)
+                .saturating_sub(now)
+        }
+    }
 }
 
 /// Marks a source as "session setup in flight" so the listener doesn't spawn
@@ -99,13 +118,12 @@ pub async fn serve_graceful(
     let limits = ConnLimits::new(cfg.max_connections, cfg.max_per_ip);
     let active = metrics.active.with_label_values(&[cfg.name.as_str()]);
 
-    // Cleanup task: sleep until the nearest idle deadline, capped at five
-    // seconds so dead relay tasks are also evicted promptly. New sessions wake
-    // it to recalculate. Without this, a dead session would pin its limits slot
-    // forever.
+    // Cleanup task: sleep until the next session is due, at most one tick.
+    // New sessions wake it to recalculate. Without this, a dead session would
+    // pin its limits slot forever.
     {
-        let sessions2 = sessions.clone();
-        let idle_secs = cfg.idle_timeout_secs;
+        let sessions = sessions.clone();
+        let idle_ms = cfg.idle_timeout_secs.saturating_mul(1000);
         let shut = cleanup_shutdown.clone();
         let closed_idle = metrics
             .connections_closed
@@ -113,57 +131,42 @@ pub async fn serve_graceful(
         let closed_error = metrics
             .connections_closed
             .with_label_values(&[cfg.name.as_str(), "error"]);
-        let active2 = active.clone();
+        let active = active.clone();
         let wakeup = cleanup_wakeup.clone();
         tokio::spawn(async move {
             loop {
                 let wait = {
-                    let map = sessions2.lock().await;
-                    if map.values().any(|s| s.cancel.is_cancelled()) {
-                        Duration::ZERO
-                    } else if idle_secs > 0 {
-                        let now = now_ms();
-                        let idle_ms = idle_secs.saturating_mul(1000);
-                        let until_idle = map
-                            .values()
-                            .map(|s| {
-                                s.last_activity
-                                    .load(Ordering::Relaxed)
-                                    .saturating_add(idle_ms)
-                                    .saturating_sub(now)
-                            })
-                            .min()
-                            .unwrap_or(5000);
-                        Duration::from_millis(until_idle.min(5000))
-                    } else {
-                        Duration::from_secs(5)
-                    }
+                    let now = now_ms();
+                    let map = sessions.lock().await;
+                    map.values()
+                        .map(|s| s.evict_in_ms(idle_ms, now))
+                        .min()
+                        .unwrap_or(CLEANUP_TICK_MS)
+                        .min(CLEANUP_TICK_MS)
                 };
 
                 tokio::select! {
                     _ = shut.cancelled() => break,
                     _ = wakeup.notified() => continue,
-                    _ = sleep(wait) => {}
+                    _ = sleep(Duration::from_millis(wait)) => {}
                 }
                 let now = now_ms();
-                let mut map = sessions2.lock().await;
+                let mut map = sessions.lock().await;
                 map.retain(|src, s| {
+                    if s.evict_in_ms(idle_ms, now) > 0 {
+                        return true;
+                    }
                     if s.cancel.is_cancelled() {
                         debug!(%src, "UDP session dead, evicting");
                         closed_error.inc();
-                        return false;
-                    }
-                    let last = s.last_activity.load(Ordering::Relaxed);
-                    let stale =
-                        idle_secs > 0 && now.saturating_sub(last) >= idle_secs.saturating_mul(1000);
-                    if stale {
+                    } else {
                         debug!(%src, "UDP session idle timeout");
                         s.cancel.cancel();
                         closed_idle.inc();
                     }
-                    !stale
+                    false
                 });
-                active2.set(map.len() as i64);
+                active.set(map.len() as i64);
             }
         });
     }
