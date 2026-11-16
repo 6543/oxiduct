@@ -76,10 +76,11 @@ async fn bind_failure_returns_error() {
     let mut cfg = cfg_tcp("127.0.0.1:1".parse().unwrap());
     cfg.listen = addr.to_string(); // already taken
 
-    // Call run() (NOT serve) to exercise the bind path
-    let result = oxiduct::proxy::tcp::run(
+    // Call run_graceful() (NOT serve) to exercise the bind path
+    let result = oxiduct::proxy::tcp::run_graceful(
         Arc::new(cfg),
         oxiduct::metrics::Metrics::new(),
+        CancellationToken::new(),
         CancellationToken::new(),
     )
     .await;

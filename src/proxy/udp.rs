@@ -55,14 +55,6 @@ impl Drop for PendingGuard {
 
 // ── Main loop ──────────────────────────────────────────────────────────────
 
-pub async fn run(
-    cfg: Arc<ProxyConfig>,
-    metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    run_graceful(cfg, metrics, shutdown.clone(), shutdown).await
-}
-
 pub async fn run_graceful(
     cfg: Arc<ProxyConfig>,
     metrics: Arc<Metrics>,
