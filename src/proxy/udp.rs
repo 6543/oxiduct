@@ -502,7 +502,8 @@ impl Relay {
         let mut last_sent: Option<Vec<u8>> = None;
         loop {
             tokio::select! {
-                biased;
+                // Not `biased`: a client that keeps the queue filled must not
+                // starve the replies.
                 _ = self.shutdown.cancelled() => break,
                 _ = self.cancel.cancelled() => break,
                 data = self.rx.recv() => match data {
@@ -651,5 +652,35 @@ mod tests {
     async fn ends_the_session_when_every_address_refuses() {
         let reply = round_trip(vec![closed_port(), closed_port()]).await;
         assert_eq!(reply, None);
+    }
+
+    /// Regression: with the client side polled first, a client that keeps the
+    /// queue filled got no replies at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replies_get_through_while_the_client_keeps_sending() {
+        let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let metrics = Metrics::new();
+        let (tx, rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+        let relay = Relay {
+            src: client.local_addr().unwrap(),
+            upstream: Upstream::connect(vec![echo().await]).await.unwrap(),
+            rx,
+            listen,
+            last_activity: Arc::new(AtomicU64::new(now_ms())),
+            cancel: cancel.clone(),
+            shutdown: CancellationToken::new(),
+            bytes_up: metrics.bytes_total.with_label_values(&["test", "up"]),
+            bytes_down: metrics.bytes_total.with_label_values(&["test", "down"]),
+        };
+        tokio::spawn(relay.run());
+        tokio::spawn(async move { while tx.send(b"ping".to_vec()).await.is_ok() {} });
+
+        let mut buf = [0u8; 64];
+        let reply = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await;
+        cancel.cancel();
+        assert!(reply.is_ok(), "no reply while the client kept sending");
     }
 }
