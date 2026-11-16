@@ -1,4 +1,4 @@
-//! Apply socket-level liveness options to TCP streams.
+//! Apply socket-level options to TCP streams: liveness, plus TCP_NODELAY.
 //!
 //! L1 – SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
 //! L2 – TCP_USER_TIMEOUT  (Linux/Android only)
@@ -16,6 +16,12 @@ use crate::config::ProxyConfig;
 
 pub fn apply_tcp(stream: &TcpStream, cfg: &ProxyConfig) {
     let sr = SockRef::from(stream);
+
+    // A relay passes on what it gets. With Nagle on, a second small write
+    // waits for the ACK of the first, which the peer delays by ~40 ms.
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("set_nodelay: {e}");
+    }
 
     // L1: keepalive
     if cfg.keepalive_idle_secs > 0 {
@@ -78,6 +84,14 @@ mod tests {
     async fn apply_all_disabled() {
         let stream = client_stream().await;
         apply_tcp(&stream, &base_cfg());
+    }
+
+    #[tokio::test]
+    async fn apply_disables_nagle() {
+        let stream = client_stream().await;
+        assert!(!stream.nodelay().unwrap());
+        apply_tcp(&stream, &base_cfg());
+        assert!(stream.nodelay().unwrap());
     }
 
     #[tokio::test]
