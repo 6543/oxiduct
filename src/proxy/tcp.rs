@@ -6,16 +6,17 @@
 //!   L3 – Application idle timeout  (no bytes either direction → kill)
 //!   L4 – Half-close grace          (one side EOF → other must show activity)
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{lookup_host, TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -177,25 +178,25 @@ async fn handle(
     let connected = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return,
-        result = tokio::time::timeout(
+        result = connect_any(
+            cfg.target.as_str(),
             Duration::from_secs(cfg.connect_timeout_secs),
-            TcpStream::connect(&cfg.target),
         ) => result,
     };
     let mut outbound = match connected {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
             metrics
-                .connect_failures
+                .connect_timeouts
                 .with_label_values(&[cfg.name.as_str()])
                 .inc();
             return;
         }
-        Err(_) => {
-            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, timeout = cfg.connect_timeout_secs, "connect timed out");
+        Err(e) => {
+            warn!(proxy = %cfg.name, id, %peer, target = %cfg.target, "connect failed: {e}");
             metrics
-                .connect_timeouts
+                .connect_failures
                 .with_label_values(&[cfg.name.as_str()])
                 .inc();
             return;
@@ -234,6 +235,26 @@ async fn handle(
     active.inc();
     relay(id, peer, inbound, outbound, &cfg, &metrics, shutdown).await;
     active.dec();
+}
+
+/// Connect to the first address of `target` that answers, within `budget`.
+///
+/// Each address gets an equal share of the time left, so one that never
+/// answers cannot use up the budget of those after it.
+async fn connect_any(target: impl ToSocketAddrs, budget: Duration) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + budget;
+    let addrs: Vec<SocketAddr> = timeout_at(deadline, lookup_host(target)).await??.collect();
+
+    let mut last_err = io::Error::other("no address resolved");
+    for (tried, addr) in addrs.iter().enumerate() {
+        let share = (deadline - Instant::now()) / (addrs.len() - tried) as u32;
+        match timeout(share, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = e,
+            Err(elapsed) => last_err = elapsed.into(),
+        }
+    }
+    Err(last_err)
 }
 
 // ── Bidirectional relay ──────────────────────────────────────────────────────
@@ -456,6 +477,46 @@ async fn watchdog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An address where connects hang: the listener's queue of one is taken
+    /// by the returned stream, so Linux drops every further handshake.
+    #[cfg(target_os = "linux")]
+    fn silent_addr() -> (SocketAddr, impl Sized) {
+        use socket2::{Domain, Socket, Type};
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener
+            .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        listener.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        let filler = std::net::TcpStream::connect(addr).unwrap();
+        (addr, (listener, filler))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_moves_on_from_an_address_that_never_answers() {
+        let (silent, _keep) = silent_addr();
+        let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = [silent, good.local_addr().unwrap()];
+
+        let stream = connect_any(&addrs[..], Duration::from_secs(2)).await;
+        assert_eq!(stream.unwrap().peer_addr().unwrap(), addrs[1]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_times_out_when_no_address_answers() {
+        let (a, _keep_a) = silent_addr();
+        let (b, _keep_b) = silent_addr();
+
+        let start = Instant::now();
+        let err = connect_any(&[a, b][..], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_millis(1500));
+    }
 
     #[tokio::test]
     async fn cancellation_interrupts_backpressured_write() {
