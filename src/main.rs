@@ -8,7 +8,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use oxiduct::{cli, config, metrics, proxy};
+use oxiduct::{cli, config, metrics, nofile, proxy};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,6 +35,20 @@ async fn main() -> Result<()> {
         )
     };
     let shutdown_grace = shutdown_grace.unwrap_or(config::defaults::SHUTDOWN_GRACE_SECS);
+
+    match nofile::raise() {
+        Ok(limit) => {
+            if let Some(needed) = nofile::fds_needed(&proxies).filter(|n| *n > limit) {
+                tracing::warn!(
+                    limit,
+                    needed,
+                    "open-file limit is below what max_connections allows; \
+                     raise it or lower max_connections"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("cannot read the open-file limit: {e}"),
+    }
 
     let stop_accepting = CancellationToken::new();
     let force_shutdown = CancellationToken::new();

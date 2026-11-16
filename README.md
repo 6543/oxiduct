@@ -127,6 +127,15 @@ See [`contrib/example.toml`](contrib/example.toml) for all available options wit
 
 ---
 
+## Open files
+
+A TCP connection uses two file descriptors, a UDP session one. At start
+`oxiduct` raises its open-file limit as far as the system allows, and warns
+if `max_connections` still needs more. Then raise the limit (systemd:
+`LimitNOFILE=`) or lower `max_connections`.
+
+---
+
 ## Metrics (Prometheus)
 
 Enable the metrics endpoint:

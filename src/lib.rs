@@ -8,5 +8,6 @@ pub mod clock;
 pub mod config;
 pub mod limits;
 pub mod metrics;
+pub mod nofile;
 pub mod proxy;
 pub mod socket_opts;
