@@ -15,6 +15,23 @@ steps:
       # Unit tests only; integration tests run in the dedicated integration workflow.
       - cargo test --lib
 
+  build-windows:
+    image: rust:latest
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - apt-get update && apt-get install -y gcc-mingw-w64-x86-64
+      - rustup target add x86_64-pc-windows-gnu
+      - cargo build --release --target x86_64-pc-windows-gnu
+
+  # Image ships zig and the macOS SDK; one binary for Intel and Apple silicon.
+  build-macos:
+    image: ghcr.io/rust-cross/cargo-zigbuild
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo zigbuild --release --target universal2-apple-darwin
+
   build-release:
     image: rust:latest
     environment:
