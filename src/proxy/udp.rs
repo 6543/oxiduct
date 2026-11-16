@@ -366,6 +366,12 @@ async fn open_session(
                 .await
                 .with_context(|| format!("DNS lookup {}", cfg.target))?
                 .collect();
+            // A "client" with the target's own address would make target
+            // and proxy answer each other forever.
+            let key = |a: &SocketAddr| (a.ip().to_canonical(), a.port());
+            if addrs.iter().any(|a| key(a) == key(&src)) {
+                anyhow::bail!("source address is the target itself");
+            }
             Upstream::connect(addrs)
                 .await
                 .with_context(|| format!("UDP connect {}", cfg.target))

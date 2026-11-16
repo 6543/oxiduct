@@ -213,3 +213,36 @@ async fn drain_completes_under_incoming_packets() {
         "drain never completed while packets kept arriving"
     );
 }
+
+/// A packet that claims to come from the target itself must not open a
+/// session: target and proxy would answer each other forever.
+#[tokio::test]
+async fn packet_from_the_target_address_starts_no_loop() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // A target that answers every datagram, and counts them.
+    let target = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let seen = Arc::new(AtomicU64::new(0));
+    {
+        let (target, seen) = (target.clone(), seen.clone());
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, peer)) = target.recv_from(&mut buf).await {
+                seen.fetch_add(1, Ordering::Relaxed);
+                let _ = target.send_to(&buf[..n], peer).await;
+            }
+        });
+    }
+
+    let proxy = spawn_udp_proxy(cfg_udp(target.local_addr().unwrap())).await;
+
+    // Sent from the target's own socket: what a spoofed packet looks like.
+    target.send_to(b"x", proxy.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let seen = seen.load(Ordering::Relaxed);
+    assert_eq!(seen, 0, "target got {seen} packets from one spoofed packet");
+
+    proxy.stop().await;
+}
