@@ -169,8 +169,8 @@ impl Drop for Guard {
     }
 }
 
-/// True once `used` has reached 90 % of `cap` (integer arithmetic, no overflow
-/// up to `u32::MAX / 10`).
+/// True once `used` has reached 90 % of `cap` (integer arithmetic; widened to
+/// `u64` so it cannot overflow).
 fn reached_90pct(used: u32, cap: u32) -> bool {
     (used as u64) * 10 >= (cap as u64) * 9
 }
