@@ -32,6 +32,10 @@ oxiduct --listen 587 --target mail.example.com:587
 oxiduct --listen 5353 --target 1.1.1.1:53 --protocol udp
 ```
 
+On a host with several addresses, give UDP the one to listen on
+(`--listen 192.0.2.1:5353`). With a bare port the reply can leave from a
+different address than the client sent to, and the client drops it.
+
 **Multiple proxies via config file:**
 ```sh
 oxiduct --config /etc/oxiduct/config.toml

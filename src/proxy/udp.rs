@@ -91,6 +91,19 @@ pub async fn run_graceful(
             .with_context(|| format!("UDP bind {}", cfg.listen))?,
     );
 
+    // Replies leave from whatever address the system picks for the route
+    // back, which a client that sent to another address of this host drops.
+    if listen_sock
+        .local_addr()
+        .is_ok_and(|a| a.ip().is_unspecified())
+    {
+        warn!(
+            proxy = %cfg.name,
+            "UDP listens on all addresses; on a host with several addresses \
+             listen on one of them, or replies may leave from the wrong one"
+        );
+    }
+
     info!(proxy = %cfg.name, "UDP listening");
     serve_graceful(listen_sock, cfg, metrics, stop_accepting, force_shutdown).await
 }
