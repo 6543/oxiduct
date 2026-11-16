@@ -106,6 +106,10 @@ pub struct Args {
 /// proxy completely silent. Require bare words to be real levels; scoping a
 /// level to one target stays available as `target=level`.
 fn parse_log_level(s: &str) -> Result<String, String> {
+    // No directive at all leaves the filter at its error-only default.
+    if s.split(',').all(str::is_empty) {
+        return Err("log level must not be empty".to_owned());
+    }
     for directive in s.split(',').filter(|d| !d.is_empty()) {
         if !directive.contains('=') && directive.parse::<LevelFilter>().is_err() {
             return Err(format!(
@@ -151,6 +155,14 @@ mod tests {
     fn log_level_rejects_unknown_bare_words() {
         // Regression: these used to parse as target names and mute all logs.
         for bad in ["verbose", "infoo", "info,bogus"] {
+            assert!(parse_log_level(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn log_level_rejects_empty_values() {
+        // Regression: `RUST_LOG=` (set but empty) muted everything below error.
+        for bad in ["", ",", ",,"] {
             assert!(parse_log_level(bad).is_err(), "{bad:?} must be rejected");
         }
     }
