@@ -84,15 +84,6 @@ pub async fn run_graceful(
 ///
 /// Public so integration tests can bind to port 0, observe the assigned port,
 /// then start the proxy on that listener.
-pub async fn serve(
-    listener: TcpListener,
-    cfg: Arc<ProxyConfig>,
-    metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    serve_graceful(listener, cfg, metrics, shutdown.clone(), shutdown).await
-}
-
 pub async fn serve_graceful(
     listener: TcpListener,
     cfg: Arc<ProxyConfig>,
